@@ -330,31 +330,51 @@ class BlellochScanner:
         # Shift inclusive prefix to make it exclusive
         # For prefix scan: rank i gets inclusive[i-1] from rank i-1
         # For suffix scan: rank i gets inclusive[i+1] from rank i+1
+        #
+        # IMPORTANT: Use non-blocking communication to avoid deadlock/serialization
 
         exclusive_prefix = torch.zeros_like(local_value)
 
         if not self.reverse:
             # PREFIX SCAN: rank i receives from rank i-1, sends to rank i+1
+            recv_req = None
+            send_req = None
+
             if self.rank > 0:
-                # Receive from left neighbor (actual rank - 1)
+                # Non-blocking receive from left neighbor
                 global_left = self.actual_to_global_rank(self.rank - 1)
-                dist.recv(tensor=exclusive_prefix, src=global_left, group=self.group)
+                recv_req = dist.irecv(tensor=exclusive_prefix, src=global_left, group=self.group)
 
             if self.rank < self.world_size - 1:
-                # Send to right neighbor (actual rank + 1)
+                # Non-blocking send to right neighbor
                 global_right = self.actual_to_global_rank(self.rank + 1)
-                dist.send(tensor=inclusive_prefix.contiguous(), dst=global_right, group=self.group)
+                send_req = dist.isend(tensor=inclusive_prefix.contiguous(), dst=global_right, group=self.group)
+
+            # Wait for completion
+            if recv_req is not None:
+                recv_req.wait()
+            if send_req is not None:
+                send_req.wait()
         else:
             # SUFFIX SCAN: rank i receives from rank i+1, sends to rank i-1
+            recv_req = None
+            send_req = None
+
             if self.rank < self.world_size - 1:
-                # Receive from right neighbor (actual rank + 1)
+                # Non-blocking receive from right neighbor
                 global_right = self.actual_to_global_rank(self.rank + 1)
-                dist.recv(tensor=exclusive_prefix, src=global_right, group=self.group)
+                recv_req = dist.irecv(tensor=exclusive_prefix, src=global_right, group=self.group)
 
             if self.rank > 0:
-                # Send to left neighbor (actual rank - 1)
+                # Non-blocking send to left neighbor
                 global_left = self.actual_to_global_rank(self.rank - 1)
-                dist.send(tensor=inclusive_prefix.contiguous(), dst=global_left, group=self.group)
+                send_req = dist.isend(tensor=inclusive_prefix.contiguous(), dst=global_left, group=self.group)
+
+            # Wait for completion
+            if recv_req is not None:
+                recv_req.wait()
+            if send_req is not None:
+                send_req.wait()
 
         return exclusive_prefix
 
