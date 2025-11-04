@@ -299,12 +299,13 @@ class LaspBlelloch(torch.autograd.Function):
             lambda_decay = torch.exp(-s.to(torch.float32))
 
             scanner = BlellochScanner(
-                rank=world_size - 1 - rank,  # Reverse for backward
+                rank=rank,  # Use actual rank, not reversed
                 world_size=world_size,
                 group=group,
                 decay_factor=lambda_decay,
                 chunk_size=n,
                 device=do.device,
+                reverse=True,  # Scan in reverse direction for backward pass
             )
 
             # Reverse scan for gradients

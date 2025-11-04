@@ -36,6 +36,7 @@ class BlellochScanner:
         decay_factor: torch.Tensor,  # λ per head (shape: [h])
         chunk_size: int,
         device: torch.device,
+        reverse: bool = False,
     ):
         """
         Initialize Blelloch scanner.
@@ -47,11 +48,13 @@ class BlellochScanner:
             decay_factor: Decay factor λ per head, shape [h]
             chunk_size: Sequence length per GPU (C)
             device: torch.device for tensors
+            reverse: If True, scan in reverse direction (for backward pass)
         """
         self.rank = rank  # Local SP rank
         self.world_size = world_size  # SP world size
         self.group = group
         self.device = device
+        self.reverse = reverse
 
         # Get global ranks for this sequence parallel group
         # This is needed because dist.send/recv with group parameter expects global ranks
@@ -62,6 +65,12 @@ class BlellochScanner:
         #   SP group 0: local [0,1,2,3] → global [0,1,2,3], offset=0
         #   SP group 1: local [0,1,2,3] → global [4,5,6,7], offset=4
         self.rank_offset = self.global_rank - self.rank
+
+        # For reverse scan, we reverse the rank order
+        if reverse:
+            self.scan_rank = world_size - 1 - rank
+        else:
+            self.scan_rank = rank
 
         # Compute decay for one chunk: λ^C per head
         self.lambda_C = decay_factor ** chunk_size  # Shape: [h]
@@ -77,7 +86,13 @@ class BlellochScanner:
         """Convert local SP rank to global rank."""
         if local_rank == -1:
             return -1
-        return local_rank + self.rank_offset
+        # For reverse scan, map reversed local rank to actual global rank
+        if self.reverse:
+            # reversed_local → actual_local → global
+            actual_local = self.world_size - 1 - local_rank
+            return actual_local + self.rank_offset
+        else:
+            return local_rank + self.rank_offset
 
     def get_partner_rank(self, level: int, phase: str) -> int:
         """
@@ -88,31 +103,31 @@ class BlellochScanner:
             phase: 'up' for up-sweep, 'down' for down-sweep
 
         Returns:
-            Partner rank, or -1 if no communication needed
+            Partner rank (in scan_rank space), or -1 if no communication needed
         """
         stride = 2 ** level
 
         if phase == 'up':
             # Up-sweep: left sends to right, right receives from left
-            if self.rank % (2 * stride) == 0:
+            if self.scan_rank % (2 * stride) == 0:
                 # Left child: send to right sibling
-                partner = self.rank + stride
+                partner = self.scan_rank + stride
                 return partner if partner < self.world_size else -1
-            elif self.rank % (2 * stride) == stride:
+            elif self.scan_rank % (2 * stride) == stride:
                 # Right child: receive from left sibling
-                return self.rank - stride
+                return self.scan_rank - stride
             else:
                 # Inactive at this level
                 return -1
 
         elif phase == 'down':
             # Down-sweep: reversed
-            if self.rank % (2 * stride) == stride:
+            if self.scan_rank % (2 * stride) == stride:
                 # Right child: receive from left parent
-                return self.rank - stride
-            elif self.rank % (2 * stride) == 0:
+                return self.scan_rank - stride
+            elif self.scan_rank % (2 * stride) == 0:
                 # Left child: send to right child
-                partner = self.rank + stride
+                partner = self.scan_rank + stride
                 return partner if partner < self.world_size else -1
             else:
                 return -1
@@ -123,18 +138,18 @@ class BlellochScanner:
         """Check if this rank sends at this level."""
         stride = 2 ** level
         if phase == 'up':
-            return self.rank % (2 * stride) == 0
+            return self.scan_rank % (2 * stride) == 0
         elif phase == 'down':
-            return self.rank % (2 * stride) == 0
+            return self.scan_rank % (2 * stride) == 0
         return False
 
     def is_receiver(self, level: int, phase: str) -> bool:
         """Check if this rank receives at this level."""
         stride = 2 ** level
         if phase == 'up':
-            return self.rank % (2 * stride) == stride
+            return self.scan_rank % (2 * stride) == stride
         elif phase == 'down':
-            return self.rank % (2 * stride) == stride
+            return self.scan_rank % (2 * stride) == stride
         return False
 
     def combine(
