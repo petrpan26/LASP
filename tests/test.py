@@ -1,10 +1,13 @@
 import argparse
+import time
 
 import torch
 import torch.distributed as dist
 from einops import rearrange
 
 from lasp import (
+    lasp_blelloch,
+    lasp_blelloch_fused,
     lasp_cache,
     lasp_fuse,
     lasp_fuse_parallel,
@@ -60,7 +63,7 @@ def split_data(x):
     return x.detach().clone()
 
 
-def test(dp_size):
+def test(dp_size, benchmark=False, num_trials=100, num_warmup=10):
     """
     As an example, assume we have 1 node with 8 GPUs and the ranks are {0, 1, 2, 3, 4, 5, 6, 7}. For data parallel size = 2 and sequence parallel size = 4, the DP and SP communication groups will be:
 
@@ -90,7 +93,12 @@ def test(dp_size):
         "cache": lasp_cache,
         "fuse": lasp_fuse,
         "fuse_parallel": lasp_fuse_parallel,
+        "blelloch": lasp_blelloch,
+        "blelloch_fused": lasp_blelloch_fused,
     }
+
+    # Storage for benchmark results
+    benchmark_results = {}
 
     b, n, h, d, e = world_size * 2, 2048, 12, 128, 64
 
@@ -141,21 +149,78 @@ def test(dp_size):
                 f"Test lasp_{name} on world size {world_size} with data_parallel_size {dp_size} and sequence_parallel_size {sp_size}:"
             )
 
-        if rank == 0:
-            print("### Forward ###")
-
-        if name == "naive":
-            oi = f(qi, ki, vi, s)
+        # Determine which interface to use
+        if name in ["naive", "blelloch", "blelloch_fused"]:
+            # Simple interface
+            def run_forward():
+                return f(qi, ki, vi, s)
         elif name == "cache":
+            # Cache interface with array
             KV = torch.empty(b_local, h, d, e).to(torch.float32).to(q.device)
             DKV = torch.empty(b_local, h, d, e).to(torch.float32).to(q.device)
             array = torch.arange(n_local).to(q)
-            oi = f(qi, ki, vi, s, array, KV, DKV)
+            def run_forward():
+                return f(qi, ki, vi, s, array, KV, DKV)
         else:
+            # Fuse interface with KV, DKV
             KV = torch.empty(b_local, h, d, e).to(torch.float32).to(q.device)
             DKV = torch.empty(b_local, h, d, e).to(torch.float32).to(q.device)
-            oi = f(qi, ki, vi, s, KV, DKV)
+            def run_forward():
+                return f(qi, ki, vi, s, KV, DKV)
 
+        # Benchmarking mode
+        if benchmark:
+            # Warmup
+            for _ in range(num_warmup):
+                qi.grad = None
+                ki.grad = None
+                vi.grad = None
+                oi_tmp = run_forward()
+                oi_tmp.backward(doi, retain_graph=True)
+
+            dist.barrier()
+
+            # Forward benchmark
+            forward_times = []
+            for _ in range(num_trials):
+                qi.grad = None
+                ki.grad = None
+                vi.grad = None
+
+                torch.cuda.synchronize()
+                start = time.perf_counter()
+                oi_tmp = run_forward()
+                torch.cuda.synchronize()
+                forward_times.append((time.perf_counter() - start) * 1000)
+
+            # Backward benchmark
+            backward_times = []
+            for _ in range(num_trials):
+                qi.grad = None
+                ki.grad = None
+                vi.grad = None
+                oi_tmp = run_forward()
+
+                torch.cuda.synchronize()
+                start = time.perf_counter()
+                oi_tmp.backward(doi, retain_graph=True)
+                torch.cuda.synchronize()
+                backward_times.append((time.perf_counter() - start) * 1000)
+
+            # Store results
+            avg_forward = sum(forward_times) / len(forward_times)
+            avg_backward = sum(backward_times) / len(backward_times)
+            benchmark_results[name] = {
+                "forward": avg_forward,
+                "backward": avg_backward,
+                "total": avg_forward + avg_backward,
+            }
+
+        # Correctness test
+        if rank == 0:
+            print("### Forward ###")
+
+        oi = run_forward()
         log("out diff", oi_ref - oi, rank0_only=True)
 
         dist.barrier()
@@ -171,11 +236,39 @@ def test(dp_size):
         log("dk diff", dk_ref - dki, rank0_only=True)
         log("dv diff", dv_ref - dvi, rank0_only=True)
 
+    # Print benchmark results
+    if benchmark and rank == 0:
+        print("\n" + "="*80)
+        print("BENCHMARK RESULTS")
+        print("="*80)
+        print(f"Configuration: world_size={world_size}, dp_size={dp_size}, sp_size={sp_size}")
+        print(f"Sequence length per GPU: {n_local}, Total: {n}")
+        print(f"Trials: {num_trials}, Warmup: {num_warmup}")
+        print("\n")
+
+        # Print table header
+        print(f"{'Method':<20} {'Forward (ms)':<15} {'Backward (ms)':<15} {'Total (ms)':<15} {'Speedup':<10}")
+        print("-" * 80)
+
+        # Get baseline (naive) for speedup calculation
+        baseline_total = benchmark_results.get("naive", {}).get("total", 1.0)
+
+        # Print results for each method
+        for name in name_2_fn_dict.keys():
+            if name in benchmark_results:
+                res = benchmark_results[name]
+                speedup = baseline_total / res["total"] if res["total"] > 0 else 0.0
+                print(f"{name:<20} {res['forward']:<15.3f} {res['backward']:<15.3f} {res['total']:<15.3f} {speedup:<10.2f}x")
+
+        print("="*80)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dp-size", help="data parallel size", type=int)
+    parser.add_argument("--dp-size", help="data parallel size", type=int, required=True)
+    parser.add_argument("--benchmark", help="run performance benchmark", action="store_true")
+    parser.add_argument("--num-trials", help="number of benchmark trials", type=int, default=100)
+    parser.add_argument("--num-warmup", help="number of warmup iterations", type=int, default=10)
     args = parser.parse_args()
-    dp_size = args.dp_size
 
-    test(dp_size)
+    test(args.dp_size, benchmark=args.benchmark, num_trials=args.num_trials, num_warmup=args.num_warmup)
