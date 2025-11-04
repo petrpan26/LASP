@@ -24,6 +24,8 @@ from lasp import (
     lasp_cache,
     lasp_fuse,
     lasp_fuse_parallel,
+    lasp_fuse_v2,
+    lasp_zeco,
     lasp_naive,
 )
 from lasp.utils import (
@@ -238,6 +240,14 @@ def benchmark_all_methods(
             "fn": lasp_fuse,
             "needs_buffers": True,
         },
+        "fuse_v2": {
+            "fn": lasp_fuse_v2,
+            "needs_buffers": True,
+        },
+        "zeco": {
+            "fn": lasp_zeco,
+            "needs_buffers": "zeco",  # Special case - no KV/DKV buffers
+        },
         "fuse_parallel": {
             "fn": lasp_fuse_parallel,
             "needs_buffers": True,
@@ -265,7 +275,7 @@ def benchmark_all_methods(
 
         # Prepare inputs based on method interface
         if not method_info["needs_buffers"]:
-            # Simple interface: naive, blelloch, blelloch_fused
+            # Simple interface: naive
             def run_forward():
                 # Clear gradients outside timed region for fairness
                 if q.grad is not None:
@@ -292,8 +302,20 @@ def benchmark_all_methods(
                     v.grad.zero_()
                 return method_info["fn"](q, k, v, s, array, KV, DKV)
 
+        elif method_info["needs_buffers"] == "zeco":
+            # ZeCO interface - no KV/DKV buffers needed
+            def run_forward():
+                # Clear gradients outside timed region for fairness
+                if q.grad is not None:
+                    q.grad.zero_()
+                if k.grad is not None:
+                    k.grad.zero_()
+                if v.grad is not None:
+                    v.grad.zero_()
+                return method_info["fn"](q, k, v, s)
+
         else:
-            # Fuse interface: fuse, fuse_parallel
+            # Fuse interface: fuse, fuse_v2, fuse_parallel
             KV = torch.empty(b_local, h, d, e, dtype=torch.float32, device=device)
             DKV = torch.empty(b_local, h, d, e, dtype=torch.float32, device=device)
 

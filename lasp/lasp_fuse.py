@@ -564,3 +564,318 @@ def lasp_fuse(q, k, v, ed, KV, DKV):
         output = output + o
 
     return output
+
+
+# LASP-2: AllGather-based implementation
+
+
+@triton.jit
+def _compute_local_kv_kernel(
+    K,
+    V,
+    S,
+    KV_out,
+    b: tl.constexpr,
+    h: tl.constexpr,
+    n: tl.constexpr,
+    d: tl.constexpr,
+    e: tl.constexpr,
+    BLOCK: tl.constexpr,
+    NUM_BLOCK: tl.constexpr,
+    DBLOCK: tl.constexpr,
+    EBLOCK: tl.constexpr,
+):
+    """Compute local memory state M_r = K^T @ V for a chunk."""
+    off_d = tl.program_id(0)
+    off_e = tl.program_id(1)
+    off_bh = tl.program_id(2)
+    off_h = off_bh % h
+
+    qk_offset = off_bh * n * d
+    v_offset = off_bh * n * e
+    kv_offset = off_bh * d * e
+
+    d_offset = off_d * DBLOCK
+    e_offset = off_e * EBLOCK
+    kv_d_offset = d_offset * e
+
+    S_block_ptr = S + off_h
+    s = tl.load(S_block_ptr)
+
+    array = tl.arange(0, BLOCK).to(tl.float32)
+    block_decay = tl.exp(-s.to(tl.float32) * BLOCK)
+    k_trans_decay = tl.exp(-s.to(tl.float32) * (BLOCK - array[None, :]))
+
+    K_trans_block_ptr = (
+        K
+        + qk_offset
+        + d_offset
+        + tl.arange(0, BLOCK)[None, :] * d
+        + tl.arange(0, DBLOCK)[:, None]
+    )
+    V_block_ptr = (
+        V
+        + v_offset
+        + e_offset
+        + tl.arange(0, BLOCK)[:, None] * e
+        + tl.arange(0, EBLOCK)[None, :]
+    )
+    KV_block_ptr = (
+        KV_out
+        + kv_offset
+        + kv_d_offset
+        + e_offset
+        + tl.arange(0, DBLOCK)[:, None] * e
+        + tl.arange(0, EBLOCK)[None, :]
+    )
+
+    kv = tl.zeros([DBLOCK, EBLOCK], dtype=tl.float32)
+    for i in range(NUM_BLOCK):
+        k_trans = tl.load(K_trans_block_ptr).to(tl.float32)
+        v = tl.load(V_block_ptr).to(tl.float32)
+
+        kv = block_decay * kv + tl.dot(k_trans * k_trans_decay, v)
+
+        K_trans_block_ptr += BLOCK * d
+        V_block_ptr += BLOCK * e
+
+    # Store local KV contribution
+    tl.store(KV_block_ptr, kv.to(KV_block_ptr.dtype.element_ty))
+
+
+def compute_local_kv(k, v, s, d_, e_, BLOCK, NUM_BLOCK):
+    """Compute local memory state M_r = K^T @ V."""
+    k = k.contiguous()
+    v = v.contiguous()
+    s = s.contiguous()
+
+    b, h, n, d = k.shape
+    e = v.shape[-1]
+    nd, ne = d // d_, e // e_
+
+    # Output shape: (b, h, d, e)
+    kv_out = torch.empty((b, h, d, e), dtype=k.dtype, device=k.device)
+
+    grid = (nd, ne, b * h)
+
+    with torch.cuda.device(k.device.index):
+        _compute_local_kv_kernel[grid](
+            k,
+            v,
+            s,
+            kv_out,
+            b,
+            h,
+            n,
+            d,
+            e,
+            BLOCK=BLOCK,
+            NUM_BLOCK=NUM_BLOCK,
+            DBLOCK=d_,
+            EBLOCK=e_,
+        )
+
+    return kv_out
+
+
+class LaspFuseV2(torch.autograd.Function):
+    """LASP-2: AllGather-based implementation for improved parallelism.
+
+    Uses a single AllGather collective instead of ring P2P communication,
+    reducing communication steps from 2(W-1) to 2, where W is world size.
+
+    Note: Assumes the sequence parallel group ranks are ordered to match
+    the sequence shard order (rank i has the i-th chunk of the sequence).
+    """
+
+    @staticmethod
+    def forward(ctx, q, k, v, s, KV, DKV):
+        b, h, n, d = q.shape
+        e = v.shape[-1]
+
+        # Get config
+        config = get_config_for_kernel('lasp_fuse', n, d, e, q.device)
+        BLOCK = config['BLOCK']
+        # Use floor division like V1 to avoid tail handling in kernel
+        NUM_BLOCK = n // BLOCK
+
+        # Use same caps as V1 to ensure nd, ne >= 1
+        # Otherwise if d=768, next_power_of_2=1024 → nd=0 → invalid grid
+        cd = 64
+        ce = 64
+        d_ = min(triton.next_power_of_2(d), cd)
+        e_ = min(triton.next_power_of_2(e), ce)
+
+        # Get parallel group info
+        group = get_sequence_parallel_group()
+        current_idx = get_sequence_parallel_rank()
+        world_size = get_sequence_parallel_world_size()
+
+        # Step 1: Compute local memory state M_r = K^T @ V
+        local_KV = compute_local_kv(k, v, s, d_, e_, BLOCK, NUM_BLOCK)
+
+        # Step 2: Compute per-rank gamma = exp(-s * n_local)
+        # This is the cumulative decay across this rank's local chunk
+        # Shape: [H] → broadcast to [1, H, 1, 1] for element-wise ops
+        n_local = NUM_BLOCK * BLOCK  # Actual processed sequence length
+        gamma_local = torch.exp(-s.to(torch.float32) * n_local).to(local_KV.dtype).view(1, h, 1, 1)
+
+        # Step 3: AllGather gamma and KV from all ranks with stream overlap
+        gamma_list = [torch.empty_like(gamma_local) for _ in range(world_size)]
+        KV_list = [torch.empty_like(local_KV) for _ in range(world_size)]
+
+        # Use separate stream for communication to enable overlap
+        comm_stream = torch.cuda.Stream()
+        comm_done = torch.cuda.Event()
+
+        with torch.cuda.stream(comm_stream):
+            dist.all_gather(gamma_list, gamma_local.contiguous(), group=group)
+            dist.all_gather(KV_list, local_KV.contiguous(), group=group)
+            comm_done.record()
+
+        # Wait for communication to complete
+        torch.cuda.current_stream().wait_event(comm_done)
+
+        # Step 4: Compute decay-weighted exclusive prefix
+        # Prefix for rank r: sum_{i<r} (prod_{t=i+1..r} gamma[t]) * local_KV[i]
+        # First compute prefix products G[r] = prod_{t=0..r-1} gamma[t]
+        G = [torch.ones_like(gamma_local)]
+        for r in range(1, world_size):
+            G.append(G[-1] * gamma_list[r - 1])
+
+        # Compute decay-weighted prefix sum
+        if current_idx > 0:
+            KV_prefix = torch.zeros_like(local_KV)
+            for i in range(current_idx):
+                # Weight for KV from rank i at rank current_idx is G[current_idx] / G[i+1]
+                weight = G[current_idx] / G[i + 1] if i + 1 < len(G) else G[current_idx]
+                KV_prefix = KV_prefix + weight * KV_list[i]
+        else:
+            # Rank 0 has no prefix
+            KV_prefix = torch.zeros_like(local_KV)
+
+        # Copy to KV buffer for kernel
+        KV.copy_(KV_prefix)
+
+        # Step 5: Run forward pass with prefix KV
+        o = lasp_forward(q, k, v, s, KV)
+
+        # Save for backward - store gamma_list and G for decay-weighted gradient suffix
+        ctx.save_for_backward(q, k, v, s, local_KV)
+        ctx.gamma_list = gamma_list
+        ctx.G = G
+        ctx.group = group
+        ctx.current_idx = current_idx
+        ctx.world_size = world_size
+        ctx.config = config
+
+        return o
+
+    @staticmethod
+    def backward(ctx, do):
+        q, k, v, s, local_KV = ctx.saved_tensors
+        gamma_list = ctx.gamma_list
+        G = ctx.G
+        group = ctx.group
+        current_idx = ctx.current_idx
+        world_size = ctx.world_size
+        config = ctx.config
+
+        b, h, n, d = q.shape
+        e = v.shape[-1]
+
+        BLOCK = config['BLOCK']
+        # Use floor division like forward to match
+        NUM_BLOCK = n // BLOCK
+
+        # Use same tile caps as forward
+        cd = 64
+        ce = 64
+        d_ = min(triton.next_power_of_2(d), cd)
+        e_ = min(triton.next_power_of_2(e), ce)
+
+        # Reconstruct decay-weighted prefix KV for this rank
+        # (We saved gamma_list and G from forward, but need to re-gather KV)
+        KV_list = [torch.empty_like(local_KV) for _ in range(world_size)]
+
+        comm_stream = torch.cuda.Stream()
+        comm_done = torch.cuda.Event()
+
+        with torch.cuda.stream(comm_stream):
+            dist.all_gather(KV_list, local_KV.contiguous(), group=group)
+            comm_done.record()
+
+        torch.cuda.current_stream().wait_event(comm_done)
+
+        # Compute decay-weighted exclusive prefix (same as forward)
+        if current_idx > 0:
+            KV_prefix = torch.zeros_like(local_KV)
+            for i in range(current_idx):
+                weight = G[current_idx] / G[i + 1] if i + 1 < len(G) else G[current_idx]
+                KV_prefix = KV_prefix + weight * KV_list[i]
+        else:
+            KV_prefix = torch.zeros_like(local_KV)
+
+        # Initialize local DKV buffer
+        local_DKV = torch.zeros_like(local_KV)
+
+        # Run backward pass - lasp_backward modifies local_DKV in-place
+        dq, dk, dv = lasp_backward(q, k, v, s, do, KV_prefix, local_DKV)
+
+        # AllGather all local DKV gradients
+        DKV_list = [torch.empty_like(local_DKV) for _ in range(world_size)]
+
+        with torch.cuda.stream(comm_stream):
+            dist.all_gather(DKV_list, local_DKV.contiguous(), group=group)
+            comm_done.record()
+
+        torch.cuda.current_stream().wait_event(comm_done)
+
+        # Compute decay-weighted gradient suffix
+        # Gradients flow from later chunks to earlier chunks with decay weights
+        # Suffix for rank r: sum_{i>r} (prod_{t=r+1..i} gamma[t]) * DKV[i]
+        if current_idx < world_size - 1:
+            DKV_suffix = torch.zeros_like(local_DKV)
+            for i in range(current_idx + 1, world_size):
+                # Weight for DKV from rank i at rank current_idx is G[i+1] / G[current_idx+1]
+                # (where G[r] = prod_{t=0..r-1} gamma[t])
+                weight = G[i + 1] / G[current_idx + 1] if current_idx + 1 < len(G) else torch.ones_like(gamma_list[0])
+                DKV_suffix = DKV_suffix + weight * DKV_list[i]
+        else:
+            DKV_suffix = torch.zeros_like(local_DKV)
+
+        # Add gradient contribution from later chunks (state-only backward)
+        if current_idx < world_size - 1:
+            # Gradient contribution from successor ranks flows through the state
+            dq_suffix, dk_suffix, dv_suffix = lasp_backward(
+                q, k, v, s, torch.zeros_like(do), torch.zeros_like(KV_prefix), DKV_suffix
+            )
+            dq = dq + dq_suffix
+            dk = dk + dk_suffix
+            dv = dv + dv_suffix
+
+        return dq, dk, dv, None, None, None
+
+
+lasp_fuse_v2_ = LaspFuseV2.apply
+
+
+def lasp_fuse_v2(q, k, v, ed, KV, DKV):
+    """
+    LASP-2: AllGather-based implementation.
+
+    Uses a single AllGather collective instead of ring P2P communication,
+    reducing communication steps from 2(W-1) to 2, where W is world size.
+
+    Args:
+        q: Query tensor [B, H, N, D]
+        k: Key tensor [B, H, N, D]
+        v: Value tensor [B, H, N, E]
+        ed: Exponential decay parameter [H]
+        KV: Buffer for KV state [B, H, D, E]
+        DKV: Buffer for gradient of KV state [B, H, D, E]
+
+    Returns:
+        output: Attention output [B, H, N, E]
+    """
+    return lasp_fuse_v2_(q, k, v, ed, KV, DKV)

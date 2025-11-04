@@ -10,6 +10,8 @@ from lasp import (
     lasp_cache,
     lasp_fuse,
     lasp_fuse_parallel,
+    lasp_fuse_v2,
+    lasp_zeco,
     lasp_naive,
     lightning_attn,
 )
@@ -91,6 +93,8 @@ def test(dp_size, benchmark=False, num_trials=100, num_warmup=10):
         "naive": lasp_naive,
         "cache": lasp_cache,
         "fuse": lasp_fuse,
+        "fuse_v2": lasp_fuse_v2,
+        "zeco": lasp_zeco,
         "fuse_parallel": lasp_fuse_parallel,
         "blelloch": lasp_blelloch,
     }
@@ -159,8 +163,12 @@ def test(dp_size, benchmark=False, num_trials=100, num_warmup=10):
             array = torch.arange(n_local).to(q)
             def run_forward():
                 return f(qi, ki, vi, s, array, KV, DKV)
+        elif name == "zeco":
+            # ZeCO interface - no KV/DKV buffers needed
+            def run_forward():
+                return f(qi, ki, vi, s)
         else:
-            # Fuse interface with KV, DKV (fuse, fuse_parallel, blelloch)
+            # Fuse interface with KV, DKV (fuse, fuse_v2, fuse_parallel, blelloch)
             KV = torch.empty(b_local, h, d, e).to(torch.float32).to(q.device)
             DKV = torch.empty(b_local, h, d, e).to(torch.float32).to(q.device)
             def run_forward():
