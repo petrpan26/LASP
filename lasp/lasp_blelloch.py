@@ -165,13 +165,22 @@ class LaspBlelloch(torch.autograd.Function):
             # but LASP needs EXCLUSIVE prefix (only previous ranks)
             KV_prefix_inclusive = scanner.scan(local_kv)
 
-            # Convert inclusive to exclusive by subtracting current rank's contribution
+            # Convert inclusive to exclusive
+            # For the LASP associative operation (λ^C, KV), we have:
+            #   inclusive[i] = λ^(C*i)*KV[0] + ... + λ^C*KV[i-1] + KV[i]
+            #   exclusive[i] = λ^(C*(i-1))*KV[0] + ... + KV[i-1]
+            #
+            # To convert: exclusive = λ^(-C) * (inclusive - KV[i])
+            #
             # NOTE: Create new tensor instead of modifying KV with .copy_()
             # This avoids modifying input buffers which can cause issues
             if rank > 0:
-                # For rank i: exclusive_prefix = inclusive_prefix - local_kv
-                # This gives us sum(kv[0:i]) instead of sum(kv[0:i+1])
-                KV_prefix = KV_prefix_inclusive - local_kv
+                # Compute λ^(-C) = 1 / λ^C
+                lambda_C_inv = 1.0 / lambda_decay ** n
+                # Expand to match tensor dimensions [h] → [b, h, d, e]
+                lambda_C_inv_expanded = lambda_C_inv.view(1, h, 1, 1).expand(b, h, d, e)
+                # exclusive = λ^(-C) * (inclusive - local)
+                KV_prefix = lambda_C_inv_expanded * (KV_prefix_inclusive - local_kv)
             else:
                 # Rank 0 has no previous ranks, so prefix is zero
                 # Use KV which is already zeroed
@@ -314,11 +323,16 @@ class LaspBlelloch(torch.autograd.Function):
             DKV_suffix_inclusive = scanner.scan(local_dkv)
 
             # Convert inclusive to exclusive
+            # Same logic as forward: exclusive = λ^(-C) * (inclusive - local)
             # NOTE: Create new tensor instead of modifying DKV with .copy_()
             # This avoids modifying saved tensors which can cause CUDA errors
             if rank < world_size - 1:
-                # For reversed rank i: exclusive_suffix = inclusive_suffix - local_dkv
-                DKV_suffix = DKV_suffix_inclusive - local_dkv
+                # Compute λ^(-C) = 1 / λ^C
+                lambda_C_inv = 1.0 / lambda_decay ** n
+                # Expand to match tensor dimensions [h] → [b, h, d, e]
+                lambda_C_inv_expanded = lambda_C_inv.view(1, h, 1, 1).expand(b, h, d, e)
+                # exclusive = λ^(-C) * (inclusive - local)
+                DKV_suffix = lambda_C_inv_expanded * (DKV_suffix_inclusive - local_dkv)
             else:
                 # Last rank (which is rank 0 in forward) has no future ranks
                 # Return zero suffix (use DKV which is already zeroed)

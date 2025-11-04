@@ -108,29 +108,56 @@ class BlellochScanner:
         stride = 2 ** level
 
         if phase == 'up':
-            # Up-sweep: left sends to right, right receives from left
-            if self.scan_rank % (2 * stride) == 0:
-                # Left child: send to right sibling
-                partner = self.scan_rank + stride
-                return partner if partner < self.world_size else -1
-            elif self.scan_rank % (2 * stride) == stride:
-                # Right child: receive from left sibling
-                return self.scan_rank - stride
+            # Up-sweep: Send from right edge of left subtree to right edge of right subtree
+            # This ensures accumulated values flow correctly up the tree
+            if level == 0:
+                # Level 0: Standard pattern (left edge sends to right edge)
+                # rank % 2 == 0 sends to rank % 2 == 1
+                if self.scan_rank % 2 == 0:
+                    partner = self.scan_rank + 1
+                    return partner if partner < self.world_size else -1
+                elif self.scan_rank % 2 == 1:
+                    return self.scan_rank - 1
+                else:
+                    return -1
             else:
-                # Inactive at this level
-                return -1
+                # Level >= 1: Right edge of left subtree sends to right edge of right subtree
+                # Sender: rank % (2*stride) == stride-1 (right edge of left subtree)
+                # Receiver: rank % (2*stride) == 2*stride-1 (right edge of right subtree)
+                if self.scan_rank % (2 * stride) == stride - 1:
+                    # Right edge of left subtree: send to right edge of right subtree
+                    partner = self.scan_rank + stride
+                    return partner if partner < self.world_size else -1
+                elif self.scan_rank % (2 * stride) == 2 * stride - 1:
+                    # Right edge of right subtree: receive from right edge of left subtree
+                    return self.scan_rank - stride
+                else:
+                    # Inactive at this level
+                    return -1
 
         elif phase == 'down':
-            # Down-sweep: reversed
-            if self.scan_rank % (2 * stride) == stride:
-                # Right child: receive from left parent
-                return self.scan_rank - stride
-            elif self.scan_rank % (2 * stride) == 0:
-                # Left child: send to right child
-                partner = self.scan_rank + stride
-                return partner if partner < self.world_size else -1
+            # Down-sweep: Distribute accumulated values from right edge of left subtree
+            # This mirrors the up-sweep pattern to ensure correct flow
+            if level == 0:
+                # Level 0: Standard pattern
+                if self.scan_rank % 2 == 1:
+                    return self.scan_rank - 1
+                elif self.scan_rank % 2 == 0:
+                    partner = self.scan_rank + 1
+                    return partner if partner < self.world_size else -1
+                else:
+                    return -1
             else:
-                return -1
+                # Level >= 1: Send from right edge of left subtree
+                if self.scan_rank % (2 * stride) == stride - 1:
+                    # Right edge of left subtree: send to middle of right subtree
+                    partner = self.scan_rank + 1
+                    return partner if partner < self.world_size else -1
+                elif self.scan_rank % (2 * stride) == stride:
+                    # Middle of right subtree: receive from right edge of left subtree
+                    return self.scan_rank - 1
+                else:
+                    return -1
         else:
             raise ValueError(f"Unknown phase: {phase}")
 
@@ -138,18 +165,38 @@ class BlellochScanner:
         """Check if this rank sends at this level."""
         stride = 2 ** level
         if phase == 'up':
-            return self.scan_rank % (2 * stride) == 0
+            if level == 0:
+                # Level 0: rank % 2 == 0 sends
+                return self.scan_rank % 2 == 0
+            else:
+                # Level >= 1: Right edge of left subtree sends (rank % 2*stride == stride-1)
+                return self.scan_rank % (2 * stride) == stride - 1
         elif phase == 'down':
-            return self.scan_rank % (2 * stride) == 0
+            if level == 0:
+                # Level 0: rank % 2 == 0 sends
+                return self.scan_rank % 2 == 0
+            else:
+                # Level >= 1: Right edge of left subtree sends
+                return self.scan_rank % (2 * stride) == stride - 1
         return False
 
     def is_receiver(self, level: int, phase: str) -> bool:
         """Check if this rank receives at this level."""
         stride = 2 ** level
         if phase == 'up':
-            return self.scan_rank % (2 * stride) == stride
+            if level == 0:
+                # Level 0: rank % 2 == 1 receives
+                return self.scan_rank % 2 == 1
+            else:
+                # Level >= 1: Right edge of right subtree receives (rank % 2*stride == 2*stride-1)
+                return self.scan_rank % (2 * stride) == 2 * stride - 1
         elif phase == 'down':
-            return self.scan_rank % (2 * stride) == stride
+            if level == 0:
+                # Level 0: rank % 2 == 1 receives
+                return self.scan_rank % 2 == 1
+            else:
+                # Level >= 1: Middle of right subtree receives
+                return self.scan_rank % (2 * stride) == stride
         return False
 
     def combine(
@@ -253,10 +300,11 @@ class BlellochScanner:
                 dist.recv(tensor=left_prefix, src=global_partner, group=self.group)
 
                 # Update prefix: combine with left neighbor's prefix
-                stride = 2 ** level
+                # Stride is the actual distance between sender and receiver
+                distance = abs(self.scan_rank - partner)
                 # Use the tree value stored during up-sweep
                 tree_idx = min(level, len(tree_values) - 1)
-                prefix_sum = self.combine(left_prefix, tree_values[tree_idx], stride)
+                prefix_sum = self.combine(left_prefix, tree_values[tree_idx], distance)
 
             elif self.is_sender(level, 'down') and partner < self.world_size:
                 # Send to right child (convert to global rank)
