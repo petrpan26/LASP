@@ -41,17 +41,27 @@ class BlellochScanner:
         Initialize Blelloch scanner.
 
         Args:
-            rank: Current GPU rank (0 to P-1)
-            world_size: Total number of GPUs (P)
-            group: PyTorch distributed group
+            rank: Current GPU rank within sequence parallel group (0 to P-1)
+            world_size: Size of sequence parallel group (P)
+            group: PyTorch distributed group for sequence parallelism
             decay_factor: Decay factor λ per head, shape [h]
             chunk_size: Sequence length per GPU (C)
             device: torch.device for tensors
         """
-        self.rank = rank
-        self.world_size = world_size
+        self.rank = rank  # Local SP rank
+        self.world_size = world_size  # SP world size
         self.group = group
         self.device = device
+
+        # Get global ranks for this sequence parallel group
+        # This is needed because dist.send/recv with group parameter expects global ranks
+        self.global_rank = dist.get_rank()
+
+        # Compute offset to convert local SP rank → global rank
+        # For dp_size=2, sp_size=4:
+        #   SP group 0: local [0,1,2,3] → global [0,1,2,3], offset=0
+        #   SP group 1: local [0,1,2,3] → global [4,5,6,7], offset=4
+        self.rank_offset = self.global_rank - self.rank
 
         # Compute decay for one chunk: λ^C per head
         self.lambda_C = decay_factor ** chunk_size  # Shape: [h]
@@ -62,6 +72,12 @@ class BlellochScanner:
 
         # Check if this rank is active (not a padding rank)
         self.is_active = rank < world_size
+
+    def local_to_global_rank(self, local_rank: int) -> int:
+        """Convert local SP rank to global rank."""
+        if local_rank == -1:
+            return -1
+        return local_rank + self.rank_offset
 
     def get_partner_rank(self, level: int, phase: str) -> int:
         """
@@ -185,13 +201,15 @@ class BlellochScanner:
                 continue
 
             if self.is_sender(level, 'up') and partner < self.world_size:
-                # Send to right partner
-                dist.send(tensor=current_value.contiguous(), dst=partner, group=self.group)
+                # Send to right partner (convert to global rank)
+                global_partner = self.local_to_global_rank(partner)
+                dist.send(tensor=current_value.contiguous(), dst=global_partner, group=self.group)
 
             elif self.is_receiver(level, 'up'):
-                # Receive from left partner and combine
+                # Receive from left partner and combine (convert to global rank)
+                global_partner = self.local_to_global_rank(partner)
                 received = torch.zeros_like(current_value)
-                dist.recv(tensor=received, src=partner, group=self.group)
+                dist.recv(tensor=received, src=global_partner, group=self.group)
 
                 # Combine: (λ^(stride*C)) * received + current
                 stride = 2 ** level
@@ -210,9 +228,10 @@ class BlellochScanner:
                 continue
 
             if self.is_receiver(level, 'down') and partner >= 0:
-                # Receive prefix from left parent
+                # Receive prefix from left parent (convert to global rank)
+                global_partner = self.local_to_global_rank(partner)
                 left_prefix = torch.zeros_like(current_value)
-                dist.recv(tensor=left_prefix, src=partner, group=self.group)
+                dist.recv(tensor=left_prefix, src=global_partner, group=self.group)
 
                 # Update prefix: combine with left neighbor's prefix
                 stride = 2 ** level
@@ -221,9 +240,10 @@ class BlellochScanner:
                 prefix_sum = self.combine(left_prefix, tree_values[tree_idx], stride)
 
             elif self.is_sender(level, 'down') and partner < self.world_size:
-                # Send to right child
+                # Send to right child (convert to global rank)
+                global_partner = self.local_to_global_rank(partner)
                 send_value = prefix_sum if prefix_sum is not None else tree_values[min(level, len(tree_values) - 1)]
-                dist.send(tensor=send_value.contiguous(), dst=partner, group=self.group)
+                dist.send(tensor=send_value.contiguous(), dst=global_partner, group=self.group)
 
         # Rank 0 has no left prefix, uses its accumulated tree value
         if prefix_sum is None:
