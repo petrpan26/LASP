@@ -94,6 +94,15 @@ class BlellochScanner:
         else:
             return local_rank + self.rank_offset
 
+    def actual_to_global_rank(self, actual_rank: int) -> int:
+        """Convert actual local rank (not scan_rank) to global rank.
+
+        Used for exclusive conversion where we use actual ranks directly.
+        """
+        if actual_rank == -1:
+            return -1
+        return actual_rank + self.rank_offset
+
     def get_partner_rank(self, level: int, phase: str) -> int:
         """
         Compute communication partner for this rank at given tree level.
@@ -318,22 +327,34 @@ class BlellochScanner:
             inclusive_prefix = tree_values[-1] if len(tree_values) > 1 else local_value
 
         # ============ CONVERT TO EXCLUSIVE ============
-        # Simple approach: rank i sends inclusive[i] to rank i+1
-        # Rank 0 returns zero, rank i returns inclusive[i-1]
+        # Shift inclusive prefix to make it exclusive
+        # For prefix scan: rank i gets inclusive[i-1] from rank i-1
+        # For suffix scan: rank i gets inclusive[i+1] from rank i+1
 
         exclusive_prefix = torch.zeros_like(local_value)
 
-        if self.scan_rank > 0:
-            # Receive from left neighbor (scan_rank - 1)
-            left_neighbor = self.scan_rank - 1
-            global_left = self.local_to_global_rank(left_neighbor)
-            dist.recv(tensor=exclusive_prefix, src=global_left, group=self.group)
+        if not self.reverse:
+            # PREFIX SCAN: rank i receives from rank i-1, sends to rank i+1
+            if self.rank > 0:
+                # Receive from left neighbor (actual rank - 1)
+                global_left = self.actual_to_global_rank(self.rank - 1)
+                dist.recv(tensor=exclusive_prefix, src=global_left, group=self.group)
 
-        if self.scan_rank < self.world_size - 1:
-            # Send to right neighbor (scan_rank + 1)
-            right_neighbor = self.scan_rank + 1
-            global_right = self.local_to_global_rank(right_neighbor)
-            dist.send(tensor=inclusive_prefix.contiguous(), dst=global_right, group=self.group)
+            if self.rank < self.world_size - 1:
+                # Send to right neighbor (actual rank + 1)
+                global_right = self.actual_to_global_rank(self.rank + 1)
+                dist.send(tensor=inclusive_prefix.contiguous(), dst=global_right, group=self.group)
+        else:
+            # SUFFIX SCAN: rank i receives from rank i+1, sends to rank i-1
+            if self.rank < self.world_size - 1:
+                # Receive from right neighbor (actual rank + 1)
+                global_right = self.actual_to_global_rank(self.rank + 1)
+                dist.recv(tensor=exclusive_prefix, src=global_right, group=self.group)
+
+            if self.rank > 0:
+                # Send to left neighbor (actual rank - 1)
+                global_left = self.actual_to_global_rank(self.rank - 1)
+                dist.send(tensor=inclusive_prefix.contiguous(), dst=global_left, group=self.group)
 
         return exclusive_prefix
 
