@@ -148,7 +148,7 @@ def test(dp_size, benchmark=False, num_trials=100, num_warmup=10):
             )
 
         # Determine which interface to use
-        if name in ["naive", "blelloch", "blelloch_fused"]:
+        if name in ["naive"]:
             # Simple interface
             def run_forward():
                 return f(qi, ki, vi, s)
@@ -160,7 +160,7 @@ def test(dp_size, benchmark=False, num_trials=100, num_warmup=10):
             def run_forward():
                 return f(qi, ki, vi, s, array, KV, DKV)
         else:
-            # Fuse interface with KV, DKV
+            # Fuse interface with KV, DKV (fuse, fuse_parallel, blelloch)
             KV = torch.empty(b_local, h, d, e).to(torch.float32).to(q.device)
             DKV = torch.empty(b_local, h, d, e).to(torch.float32).to(q.device)
             def run_forward():

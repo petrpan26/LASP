@@ -42,10 +42,11 @@ class LaspBlelloch(torch.autograd.Function):
         - O(log P) communication (Blelloch tree) instead of O(P) (ring)
         - Fused Triton kernels for inter-chunk matmul instead of PyTorch matmul
         - Optimized intra-chunk computation with parallel kernels
+        - Reuses KV/DKV buffers to avoid allocation overhead
     """
 
     @staticmethod
-    def forward(ctx, q, k, v, s):
+    def forward(ctx, q, k, v, s, KV, DKV):
         """
         Forward pass with Blelloch scan and fused kernels.
 
@@ -54,12 +55,17 @@ class LaspBlelloch(torch.autograd.Function):
             k: Key (b, h, n, d)
             v: Value (b, h, n, e)
             s: Decay factor per head (h,)
+            KV: Buffer for KV state (b, h, d, e) - reused across iterations
+            DKV: Buffer for DKV state (b, h, d, e) - saved for backward
 
         Returns:
             o: Output attention (b, h, n, e)
         """
         b, h, n, d = q.shape
         e = v.shape[-1]
+
+        # Zero out KV buffer (reused across iterations)
+        KV.zero_()
 
         # Get distributed context
         group = get_sequence_parallel_group()
@@ -139,7 +145,8 @@ class LaspBlelloch(torch.autograd.Function):
         # ===== STEP 3: Blelloch scan for inter-chunk KV accumulation =====
         if world_size == 1:
             # Single GPU: no inter-chunk communication
-            KV_prefix = torch.zeros(b, h, d, e, dtype=torch.float32, device=q.device)
+            # Use KV buffer directly (already zeroed)
+            KV_prefix = KV
         else:
             # Multi-GPU: Blelloch tree scan O(log P)
             lambda_decay = torch.exp(-s.to(torch.float32))
@@ -159,13 +166,16 @@ class LaspBlelloch(torch.autograd.Function):
             KV_prefix_inclusive = scanner.scan(local_kv)
 
             # Convert inclusive to exclusive by subtracting current rank's contribution
+            # NOTE: Create new tensor instead of modifying KV with .copy_()
+            # This avoids modifying input buffers which can cause issues
             if rank > 0:
                 # For rank i: exclusive_prefix = inclusive_prefix - local_kv
                 # This gives us sum(kv[0:i]) instead of sum(kv[0:i+1])
                 KV_prefix = KV_prefix_inclusive - local_kv
             else:
                 # Rank 0 has no previous ranks, so prefix is zero
-                KV_prefix = torch.zeros_like(KV_prefix_inclusive)
+                # Use KV which is already zeroed
+                KV_prefix = KV
 
         # ===== STEP 4: Inter-chunk attention using fused kernel =====
         # This is the key improvement: use _fwd_none_diag_kernel instead of torch.matmul
@@ -186,7 +196,10 @@ class LaspBlelloch(torch.autograd.Function):
             )
 
         # Save for backward
-        ctx.save_for_backward(q, k, v, s, kv, KV_prefix)
+        # Clone KV_prefix because it points to KV buffer which might be modified
+        KV_prefix_saved = KV_prefix.clone()
+        # Save DKV buffer for use in backward pass (same pattern as lasp_fuse_parallel)
+        ctx.save_for_backward(q, k, v, s, kv, KV_prefix_saved, DKV)
         ctx.group = group
         ctx.rank = rank
         ctx.world_size = world_size
@@ -205,7 +218,7 @@ class LaspBlelloch(torch.autograd.Function):
         """
         Backward pass with reverse Blelloch scan and fused kernels.
         """
-        q, k, v, s, kv, KV_prefix = ctx.saved_tensors
+        q, k, v, s, kv, KV_prefix, DKV = ctx.saved_tensors
         group = ctx.group
         rank = ctx.rank
         world_size = ctx.world_size
@@ -219,6 +232,9 @@ class LaspBlelloch(torch.autograd.Function):
 
         b, h, n, d = q.shape
         e = v.shape[-1]
+
+        # Zero out DKV buffer (same pattern as lasp_fuse_parallel line 1128)
+        DKV.zero_()
 
         # Make inputs contiguous
         do = do.contiguous()
@@ -276,7 +292,8 @@ class LaspBlelloch(torch.autograd.Function):
         # ===== STEP 3: Reverse Blelloch scan for gradient accumulation =====
         if world_size == 1:
             # Single GPU: no inter-chunk gradients
-            DKV_suffix = torch.zeros(b, h, d, e, dtype=torch.float32, device=do.device)
+            # DKV buffer is already zeroed, use it directly (no .copy_() needed)
+            DKV_suffix = DKV
         else:
             # Multi-GPU: Reverse Blelloch scan
             lambda_decay = torch.exp(-s.to(torch.float32))
@@ -296,12 +313,15 @@ class LaspBlelloch(torch.autograd.Function):
             DKV_suffix_inclusive = scanner.scan(local_dkv)
 
             # Convert inclusive to exclusive
+            # NOTE: Create new tensor instead of modifying DKV with .copy_()
+            # This avoids modifying saved tensors which can cause CUDA errors
             if rank < world_size - 1:
                 # For reversed rank i: exclusive_suffix = inclusive_suffix - local_dkv
                 DKV_suffix = DKV_suffix_inclusive - local_dkv
             else:
                 # Last rank (which is rank 0 in forward) has no future ranks
-                DKV_suffix = torch.zeros_like(DKV_suffix_inclusive)
+                # Return zero suffix (use DKV which is already zeroed)
+                DKV_suffix = DKV
 
         # ===== STEP 4: Inter-chunk gradient contribution using fused kernel =====
         with torch.cuda.device(q.device.index):
@@ -322,27 +342,50 @@ class LaspBlelloch(torch.autograd.Function):
                 NUM_CBLOCK=NUM_CBLOCK,
             )
 
-        return dq, dk, dv, None
+        return dq, dk, dv, None, None, None
 
 
 lasp_blelloch_ = LaspBlelloch.apply
 
 
-def lasp_blelloch(q, k, v, ed):
+def lasp_blelloch(q, k, v, ed, KV, DKV):
     """
     LASP with Blelloch scan and optimized Triton kernels.
 
     Combines:
     - Blelloch tree O(log P) communication
     - Fused Triton kernels for computation
+    - Reuses KV/DKV buffers to avoid allocation overhead
 
     Args:
         q, k, v: Query, key, value tensors
         ed: Exponential decay factors
+        KV: Buffer for KV state (b, h, d, e) - reused across iterations
+        DKV: Buffer for DKV state (b, h, d, e) - reused across iterations
 
     Returns:
         Attention output
     """
-    d = q.shape[-1]
-    ed = ed[:d]
-    return lasp_blelloch_(q, k, v, ed)
+    b, h, n, d = q.shape
+    e = v.shape[-1]
+
+    if d >= 128:
+        m = 128
+    else:
+        m = 64
+    arr = [m * i for i in range(d // m + 1)]
+    if arr[-1] != d:
+        arr.append(d)
+    n_splits = len(arr)
+    output = 0
+    for i in range(n_splits - 1):
+        s = arr[i]
+        e_idx = arr[i + 1]
+        q1 = q[..., s:e_idx]
+        k1 = k[..., s:e_idx]
+        o = lasp_blelloch_(
+            q1, k1, v, ed, KV[:, :, s:e_idx].contiguous(), DKV[:, :, s:e_idx].contiguous()
+        )
+        output = output + o
+
+    return output

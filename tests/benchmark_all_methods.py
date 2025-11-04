@@ -220,7 +220,7 @@ def benchmark_all_methods(
         },
         "blelloch": {
             "fn": lasp_blelloch,
-            "needs_buffers": False,
+            "needs_buffers": True,
         },
     }
 
