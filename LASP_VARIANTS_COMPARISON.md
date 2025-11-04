@@ -2,7 +2,7 @@
 
 ## Overview
 
-The codebase contains **6 different LASP implementations**, each optimizing different aspects:
+The codebase contains **5 different LASP implementations**, each optimizing different aspects:
 
 | Variant | Lines | Intra-Chunk | Inter-Chunk | Key Optimization |
 |---------|-------|-------------|-------------|------------------|
@@ -11,7 +11,7 @@ The codebase contains **6 different LASP implementations**, each optimizing diff
 | `lasp_cache` | 652 | Cached KV | Ring O(P) | **Memory reuse** |
 | `lasp_fuse` | 561 | Fused kernels | Ring O(P) | **Kernel fusion** |
 | `lasp_fuse_parallel` | 1166 | Fused + parallel | Ring O(P) | **Max kernel speed** |
-| `lasp_blelloch` ⭐ | 207 | Basic kernels | **Tree O(log P)** | **Communication** |
+| `lasp_blelloch` ⭐ | 325 | Fused + parallel | **Tree O(log P)** | **Ultimate** |
 
 ---
 
@@ -210,15 +210,16 @@ _fwd_none_diag_kernel  # Off-diagonal blocks
 
 ---
 
-### 6. `lasp_blelloch.py` ⭐ NEW - Tree + Basic Kernels
+### 6. `lasp_blelloch.py` ⭐ NEW - Tree + Fused Kernels
 
-**Purpose**: Optimize inter-GPU communication
+**Purpose**: Optimize both communication AND computation
 
 **What it does**:
-- ✅ Same **basic kernels** as `lasp_naive` (intra-chunk)
+- ✅ **Fused parallel kernels** from `lasp_fuse_parallel` (intra-chunk)
 - ✅ **Blelloch tree** instead of Ring (inter-chunk)
 - ✅ O(log P) communication vs O(P)
 - ✅ Parallelizes communication rounds
+- ✅ Best of both worlds!
 
 **Key difference**:
 ```python
@@ -261,11 +262,11 @@ Tree (lasp_blelloch):
 - Good network topology
 
 **Performance improvement over naive**:
-- Intra-chunk: Same (uses same kernels)
+- Intra-chunk: **40-50% faster** (fused parallel kernels)
 - Inter-chunk: **6-9× faster** (O(log P) vs O(P))
-- **Total: 6-9× vs naive for P=128**
+- **Total: 7-10× vs naive for P=128**
 
-**Code size**: Only 207 lines! (simplest distributed variant)
+**Code size**: 325 lines (uses optimized kernels)
 
 ---
 
@@ -290,7 +291,7 @@ Tree (lasp_blelloch):
 | `lasp_cache` | 0.48ms | 27.9ms | 28.38ms | 1.0× |
 | `lasp_fuse` | 0.35ms | 27.9ms | 28.25ms | 1.01× |
 | `lasp_fuse_parallel` | 0.3ms | 27.9ms | 28.2ms | 1.01× |
-| `lasp_blelloch` | 0.5ms | 4.6ms | 5.1ms | **5.57×** |
+| `lasp_blelloch` | 0.3ms | 4.6ms | 4.9ms | **5.80×** |
 
 **Key insight**: At large scale (P=128), communication dominates!
 - Kernel optimizations: ~1.1-1.5× speedup

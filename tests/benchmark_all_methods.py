@@ -21,7 +21,6 @@ from einops import rearrange
 
 from lasp import (
     lasp_blelloch,
-    lasp_blelloch_fused,
     lasp_cache,
     lasp_fuse,
     lasp_fuse_parallel,
@@ -221,10 +220,6 @@ def benchmark_all_methods(
         },
         "blelloch": {
             "fn": lasp_blelloch,
-            "needs_buffers": False,
-        },
-        "blelloch_fused": {
-            "fn": lasp_blelloch_fused,
             "needs_buffers": False,
         },
     }
