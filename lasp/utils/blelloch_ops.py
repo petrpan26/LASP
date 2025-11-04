@@ -159,9 +159,12 @@ class BlellochScanner:
         stride: int,
     ) -> torch.Tensor:
         """
-        Combine operation: (λ^(stride*C)) * received + local
+        Combine operation for LASP prefix/suffix scan.
 
-        This is the associative operator for LASP prefix scan.
+        Forward (prefix): (λ^(stride*C)) * received + local
+        Backward (suffix): local + (λ^(stride*C)) * received
+
+        The associative operator remains the same, just the order changes.
 
         Args:
             received: Tensor from communication partner
@@ -184,6 +187,7 @@ class BlellochScanner:
                 decay_power = decay_power.unsqueeze(-1)
 
         # Combine: decay * received + local
+        # This works for both prefix and suffix scans with appropriate rank ordering
         return decay_power * received + local
 
     def scan(self, local_value: torch.Tensor) -> torch.Tensor:
