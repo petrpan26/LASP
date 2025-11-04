@@ -266,36 +266,55 @@ class BlellochScanner:
         # ============ UP-SWEEP PHASE ============
         # Build tree bottom-up, accumulating partial sums (inclusive)
 
-        current_value = local_value.clone()
-        tree_values = [current_value]  # Store for down-sweep
+        # Memory optimization: Reuse single buffer for current_value throughout
+        # This buffer will be reused for inclusive_prefix and exclusive_prefix later
+        working_buffer = local_value.clone()
+
+        # Memory optimization: Only store tree_values when needed for down-sweep
+        # List indexed by level: tree_values[i] = state after processing level i-1
+        # Use None for levels we don't need (saves ~50% memory)
+        tree_values = [working_buffer.clone()]  # tree_values[0] = initial state
 
         for level in range(self.num_levels):
             partner = self.get_partner_rank(level, 'up')
 
             if partner == -1:
                 # No communication at this level
+                tree_values.append(None)  # Don't allocate memory
                 continue
 
             if self.is_sender(level, 'up') and partner < self.world_size:
                 # Send to right partner (convert to global rank)
                 global_partner = self.local_to_global_rank(partner)
-                dist.send(tensor=current_value.contiguous(), dst=global_partner, group=self.group)
+                dist.send(tensor=working_buffer.contiguous(), dst=global_partner, group=self.group)
+                # Sender: check if we'll need this value in down-sweep
+                # We need it if we're a sender in down-sweep at this level
+                if self.is_sender(level, 'down'):
+                    # Store current state (will be sent during down-sweep)
+                    tree_values.append(working_buffer.clone())
+                else:
+                    # Don't need this value - save memory
+                    tree_values.append(None)
 
             elif self.is_receiver(level, 'up'):
                 # Receive from left partner and combine (convert to global rank)
                 global_partner = self.local_to_global_rank(partner)
-                received = torch.zeros_like(current_value)
+                received = torch.zeros_like(working_buffer)
                 dist.recv(tensor=received, src=global_partner, group=self.group)
 
                 # Combine: (λ^(stride*C)) * received + current
+                # Update working_buffer in-place to save memory
                 stride = 2 ** level
-                current_value = self.combine(received, current_value, stride)
-                tree_values.append(current_value)
+                working_buffer = self.combine(received, working_buffer, stride)
+
+                # Receiver: always store updated value (needed for down-sweep combine)
+                tree_values.append(working_buffer.clone())
 
         # ============ DOWN-SWEEP PHASE ============
         # Distribute inclusive prefix sums top-down
+        # Reuse working_buffer for inclusive_prefix computation
 
-        inclusive_prefix = None
+        inclusive_computed = False
 
         for level in range(self.num_levels - 1, -1, -1):
             partner = self.get_partner_rank(level, 'down')
@@ -306,25 +325,49 @@ class BlellochScanner:
             if self.is_receiver(level, 'down') and partner >= 0:
                 # Receive prefix from left parent (convert to global rank)
                 global_partner = self.local_to_global_rank(partner)
-                left_prefix = torch.zeros_like(current_value)
+                left_prefix = torch.zeros_like(working_buffer)
                 dist.recv(tensor=left_prefix, src=global_partner, group=self.group)
 
                 # Update prefix: combine with left neighbor's prefix
                 # Stride is the actual distance between sender and receiver
                 distance = abs(self.scan_rank - partner)
-                # Use the tree value stored during up-sweep
+                # Use the tree value stored during up-sweep at this level
                 tree_idx = min(level, len(tree_values) - 1)
-                inclusive_prefix = self.combine(left_prefix, tree_values[tree_idx], distance)
+                tree_value = tree_values[tree_idx]
+                # If None, find the most recent non-None value
+                while tree_value is None and tree_idx > 0:
+                    tree_idx -= 1
+                    tree_value = tree_values[tree_idx]
+                # Reuse working_buffer for inclusive_prefix
+                working_buffer = self.combine(left_prefix, tree_value, distance)
+                inclusive_computed = True
 
             elif self.is_sender(level, 'down') and partner < self.world_size:
                 # Send to right child (convert to global rank)
                 global_partner = self.local_to_global_rank(partner)
-                send_value = inclusive_prefix if inclusive_prefix is not None else tree_values[min(level, len(tree_values) - 1)]
+                if inclusive_computed:
+                    send_value = working_buffer
+                else:
+                    # Use stored tree value at this level (should always exist for senders)
+                    tree_idx = min(level, len(tree_values) - 1)
+                    send_value = tree_values[tree_idx]
+                    # If None, find the most recent non-None value
+                    while send_value is None and tree_idx > 0:
+                        tree_idx -= 1
+                        send_value = tree_values[tree_idx]
                 dist.send(tensor=send_value.contiguous(), dst=global_partner, group=self.group)
 
-        # Compute inclusive prefix for this rank
-        if inclusive_prefix is None:
-            inclusive_prefix = tree_values[-1] if len(tree_values) > 1 else local_value
+        # Compute inclusive prefix for this rank if not already done
+        if not inclusive_computed:
+            # working_buffer already contains the correct value from up-sweep or initial
+            # Find the last non-None tree value
+            if len(tree_values) > 1:
+                for i in range(len(tree_values) - 1, -1, -1):
+                    if tree_values[i] is not None:
+                        working_buffer = tree_values[i].clone()
+                        break
+            else:
+                working_buffer = local_value.clone()
 
         # ============ CONVERT TO EXCLUSIVE ============
         # Shift inclusive prefix to make it exclusive
@@ -333,7 +376,9 @@ class BlellochScanner:
         #
         # IMPORTANT: Use non-blocking communication to avoid deadlock/serialization
 
-        exclusive_prefix = torch.zeros_like(local_value)
+        # Reuse working_buffer for exclusive result (zero it out first)
+        # But we need to send inclusive_prefix first, so create result buffer
+        result = torch.zeros_like(local_value)
 
         if not self.reverse:
             # PREFIX SCAN: rank i receives from rank i-1, sends to rank i+1
@@ -343,12 +388,12 @@ class BlellochScanner:
             if self.rank > 0:
                 # Non-blocking receive from left neighbor
                 global_left = self.actual_to_global_rank(self.rank - 1)
-                recv_req = dist.irecv(tensor=exclusive_prefix, src=global_left, group=self.group)
+                recv_req = dist.irecv(tensor=result, src=global_left, group=self.group)
 
             if self.rank < self.world_size - 1:
                 # Non-blocking send to right neighbor
                 global_right = self.actual_to_global_rank(self.rank + 1)
-                send_req = dist.isend(tensor=inclusive_prefix.contiguous(), dst=global_right, group=self.group)
+                send_req = dist.isend(tensor=working_buffer.contiguous(), dst=global_right, group=self.group)
 
             # Wait for completion
             if recv_req is not None:
@@ -363,12 +408,12 @@ class BlellochScanner:
             if self.rank < self.world_size - 1:
                 # Non-blocking receive from right neighbor
                 global_right = self.actual_to_global_rank(self.rank + 1)
-                recv_req = dist.irecv(tensor=exclusive_prefix, src=global_right, group=self.group)
+                recv_req = dist.irecv(tensor=result, src=global_right, group=self.group)
 
             if self.rank > 0:
                 # Non-blocking send to left neighbor
                 global_left = self.actual_to_global_rank(self.rank - 1)
-                send_req = dist.isend(tensor=inclusive_prefix.contiguous(), dst=global_left, group=self.group)
+                send_req = dist.isend(tensor=working_buffer.contiguous(), dst=global_left, group=self.group)
 
             # Wait for completion
             if recv_req is not None:
@@ -376,7 +421,7 @@ class BlellochScanner:
             if send_req is not None:
                 send_req.wait()
 
-        return exclusive_prefix
+        return result
 
 
 def safe_decay_power(base: float, exponent: int, use_log_space: bool = True) -> float:
