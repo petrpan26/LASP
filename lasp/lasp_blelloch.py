@@ -308,7 +308,10 @@ class LaspBlelloch(torch.autograd.Function):
             grid = (b * h, NUM_BLOCK * NUM_CBLOCK, NUM_FBLOCK)
             _bwd_none_diag_kernel[grid](
                 q, k, v, s, do, dq, dk, dv,
-                dkv, DKV_suffix, kv, KV_prefix,
+                kv,          # KV: local KV buffer from forward
+                dkv,         # DKV: local dKV buffer from backward
+                KV_prefix,   # GKV: accumulated KV from forward (prefix)
+                DKV_suffix,  # GDKV: accumulated dKV from backward (suffix)
                 b, h, n, d, e,
                 BLOCK=BLOCK,
                 NUM_BLOCK=NUM_BLOCK,
