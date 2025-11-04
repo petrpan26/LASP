@@ -161,30 +161,8 @@ class LaspBlelloch(torch.autograd.Function):
             )
 
             # Blelloch scan: O(log P) tree communication
-            # IMPORTANT: Blelloch returns INCLUSIVE prefix (includes current rank)
-            # but LASP needs EXCLUSIVE prefix (only previous ranks)
-            KV_prefix_inclusive = scanner.scan(local_kv)
-
-            # Convert inclusive to exclusive
-            # For the LASP associative operation (λ^C, KV), we have:
-            #   inclusive[i] = λ^(C*i)*KV[0] + ... + λ^C*KV[i-1] + KV[i]
-            #   exclusive[i] = λ^(C*(i-1))*KV[0] + ... + KV[i-1]
-            #
-            # To convert: exclusive = λ^(-C) * (inclusive - KV[i])
-            #
-            # NOTE: Create new tensor instead of modifying KV with .copy_()
-            # This avoids modifying input buffers which can cause issues
-            if rank > 0:
-                # Compute λ^(-C) = 1 / λ^C
-                lambda_C_inv = 1.0 / lambda_decay ** n
-                # Expand to match tensor dimensions [h] → [b, h, d, e]
-                lambda_C_inv_expanded = lambda_C_inv.view(1, h, 1, 1).expand(b, h, d, e)
-                # exclusive = λ^(-C) * (inclusive - local)
-                KV_prefix = lambda_C_inv_expanded * (KV_prefix_inclusive - local_kv)
-            else:
-                # Rank 0 has no previous ranks, so prefix is zero
-                # Use KV which is already zeroed
-                KV_prefix = KV
+            # Returns EXCLUSIVE prefix (only previous ranks, not including current)
+            KV_prefix = scanner.scan(local_kv)
 
         # ===== STEP 4: Inter-chunk attention using fused kernel =====
         # This is the key improvement: use _fwd_none_diag_kernel instead of torch.matmul
@@ -318,25 +296,8 @@ class LaspBlelloch(torch.autograd.Function):
             )
 
             # Reverse scan for gradients
-            # IMPORTANT: Blelloch returns INCLUSIVE suffix (includes current rank)
-            # but LASP needs EXCLUSIVE suffix (only future ranks)
-            DKV_suffix_inclusive = scanner.scan(local_dkv)
-
-            # Convert inclusive to exclusive
-            # Same logic as forward: exclusive = λ^(-C) * (inclusive - local)
-            # NOTE: Create new tensor instead of modifying DKV with .copy_()
-            # This avoids modifying saved tensors which can cause CUDA errors
-            if rank < world_size - 1:
-                # Compute λ^(-C) = 1 / λ^C
-                lambda_C_inv = 1.0 / lambda_decay ** n
-                # Expand to match tensor dimensions [h] → [b, h, d, e]
-                lambda_C_inv_expanded = lambda_C_inv.view(1, h, 1, 1).expand(b, h, d, e)
-                # exclusive = λ^(-C) * (inclusive - local)
-                DKV_suffix = lambda_C_inv_expanded * (DKV_suffix_inclusive - local_dkv)
-            else:
-                # Last rank (which is rank 0 in forward) has no future ranks
-                # Return zero suffix (use DKV which is already zeroed)
-                DKV_suffix = DKV
+            # Returns EXCLUSIVE suffix (only future ranks, not including current)
+            DKV_suffix = scanner.scan(local_dkv)
 
         # ===== STEP 4: Inter-chunk gradient contribution using fused kernel =====
         with torch.cuda.device(q.device.index):

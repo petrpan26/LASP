@@ -239,22 +239,23 @@ class BlellochScanner:
 
     def scan(self, local_value: torch.Tensor) -> torch.Tensor:
         """
-        Perform parallel prefix scan on local KV contribution.
+        Perform parallel EXCLUSIVE prefix scan on local KV contribution.
 
         Args:
             local_value: Local KV state b[rank] (shape: [b, h, d, e])
 
         Returns:
-            prefix_sum: KV[0:rank+1] - prefix sum up to this rank
+            exclusive_prefix: KV[0:rank] - prefix sum excluding current rank
+                              (rank 0 gets zero, rank i gets sum from ranks 0 to i-1)
         """
         if self.world_size == 1:
-            # Single GPU: no communication needed
-            return local_value
+            # Single GPU: exclusive prefix is zero (no previous ranks)
+            return torch.zeros_like(local_value)
 
         b, h, d, e = local_value.shape
 
         # ============ UP-SWEEP PHASE ============
-        # Build tree bottom-up, accumulating partial sums
+        # Build tree bottom-up, accumulating partial sums (inclusive)
 
         current_value = local_value.clone()
         tree_values = [current_value]  # Store for down-sweep
@@ -283,9 +284,9 @@ class BlellochScanner:
                 tree_values.append(current_value)
 
         # ============ DOWN-SWEEP PHASE ============
-        # Distribute prefix sums top-down
+        # Distribute inclusive prefix sums top-down
 
-        prefix_sum = None
+        inclusive_prefix = None
 
         for level in range(self.num_levels - 1, -1, -1):
             partner = self.get_partner_rank(level, 'down')
@@ -304,19 +305,37 @@ class BlellochScanner:
                 distance = abs(self.scan_rank - partner)
                 # Use the tree value stored during up-sweep
                 tree_idx = min(level, len(tree_values) - 1)
-                prefix_sum = self.combine(left_prefix, tree_values[tree_idx], distance)
+                inclusive_prefix = self.combine(left_prefix, tree_values[tree_idx], distance)
 
             elif self.is_sender(level, 'down') and partner < self.world_size:
                 # Send to right child (convert to global rank)
                 global_partner = self.local_to_global_rank(partner)
-                send_value = prefix_sum if prefix_sum is not None else tree_values[min(level, len(tree_values) - 1)]
+                send_value = inclusive_prefix if inclusive_prefix is not None else tree_values[min(level, len(tree_values) - 1)]
                 dist.send(tensor=send_value.contiguous(), dst=global_partner, group=self.group)
 
-        # Rank 0 has no left prefix, uses its accumulated tree value
-        if prefix_sum is None:
-            prefix_sum = tree_values[-1] if len(tree_values) > 1 else local_value
+        # Compute inclusive prefix for this rank
+        if inclusive_prefix is None:
+            inclusive_prefix = tree_values[-1] if len(tree_values) > 1 else local_value
 
-        return prefix_sum
+        # ============ CONVERT TO EXCLUSIVE ============
+        # Simple approach: rank i sends inclusive[i] to rank i+1
+        # Rank 0 returns zero, rank i returns inclusive[i-1]
+
+        exclusive_prefix = torch.zeros_like(local_value)
+
+        if self.scan_rank > 0:
+            # Receive from left neighbor (scan_rank - 1)
+            left_neighbor = self.scan_rank - 1
+            global_left = self.local_to_global_rank(left_neighbor)
+            dist.recv(tensor=exclusive_prefix, src=global_left, group=self.group)
+
+        if self.scan_rank < self.world_size - 1:
+            # Send to right neighbor (scan_rank + 1)
+            right_neighbor = self.scan_rank + 1
+            global_right = self.local_to_global_rank(right_neighbor)
+            dist.send(tensor=inclusive_prefix.contiguous(), dst=global_right, group=self.group)
+
+        return exclusive_prefix
 
 
 def safe_decay_power(base: float, exponent: int, use_log_space: bool = True) -> float:

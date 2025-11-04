@@ -45,20 +45,30 @@ def benchmark_forward(run_fn, num_trials=100, num_warmup=10):
     """Benchmark forward pass only."""
     times = []
 
+    # Clear cache once before warmup
+    clear_cache()
+    dist.barrier()
+    
     # Warmup
     for _ in range(num_warmup):
-        clear_cache()
         _ = run_fn()
-        torch.cuda.synchronize()
+    
+    torch.cuda.synchronize()
+    dist.barrier()
+    
+    # Clear cache once before benchmarking
+    clear_cache()
+    dist.barrier()
 
     # Benchmark
     for _ in range(num_trials):
-        clear_cache()
-
+        # Time forward
+        dist.barrier()
         torch.cuda.synchronize()
         start = time.perf_counter()
         output = run_fn()
         torch.cuda.synchronize()
+        dist.barrier()
         elapsed = (time.perf_counter() - start) * 1000  # ms
 
         times.append(elapsed)
@@ -297,9 +307,20 @@ def benchmark_all_methods(
                     v.grad.zero_()
                 return method_info["fn"](q, k, v, s, KV, DKV)
 
+        # Benchmark forward-only
+        if rank == 0:
+            print(f"  Running forward-only benchmark: {num_trials} trials with {num_warmup} warmup iterations...")
+        
+        forward_only_times = benchmark_forward(run_forward, num_trials, num_warmup)
+        forward_only_stats = compute_stats(forward_only_times)
+        
+        dist.barrier()
+        clear_cache()
+        dist.barrier()
+
         # Benchmark forward + backward
         if rank == 0:
-            print(f"  Running {num_trials} trials with {num_warmup} warmup iterations...")
+            print(f"  Running forward+backward benchmark: {num_trials} trials with {num_warmup} warmup iterations...")
 
         forward_times, backward_times, total_times = benchmark_backward(
             run_forward, do_grad, num_trials, num_warmup
@@ -311,7 +332,12 @@ def benchmark_all_methods(
         total_stats = compute_stats(total_times)
 
         # Calculate throughput (tokens/second and samples/second)
-        # Throughput = (batch_size * sequence_length) / time_in_seconds
+        # Forward-only throughput
+        forward_only_time_seconds = forward_only_stats['mean'] / 1000.0
+        tokens_per_second_forward_only = (b * n) / forward_only_time_seconds if forward_only_time_seconds > 0 else 0.0
+        samples_per_second_forward_only = b / forward_only_time_seconds if forward_only_time_seconds > 0 else 0.0
+        
+        # Forward + backward throughput
         total_time_seconds = total_stats['mean'] / 1000.0  # Convert ms to seconds
         forward_time_seconds = forward_stats['mean'] / 1000.0
         backward_time_seconds = backward_stats['mean'] / 1000.0
@@ -325,10 +351,15 @@ def benchmark_all_methods(
         samples_per_second_backward = b / backward_time_seconds if backward_time_seconds > 0 else 0.0
 
         results[method_name] = {
+            "forward_only": forward_only_stats,
             "forward": forward_stats,
             "backward": backward_stats,
             "total": total_stats,
             "throughput": {
+                "forward_only": {
+                    "tokens_per_second": tokens_per_second_forward_only,
+                    "samples_per_second": samples_per_second_forward_only,
+                },
                 "tokens_per_second": {
                     "forward": tokens_per_second_forward,
                     "backward": tokens_per_second_backward,
@@ -343,10 +374,13 @@ def benchmark_all_methods(
         }
 
         if rank == 0:
-            print(f"  Forward:  {forward_stats['mean']:.3f} ± {forward_stats['std']:.3f} ms")
-            print(f"  Backward: {backward_stats['mean']:.3f} ± {backward_stats['std']:.3f} ms")
-            print(f"  Total:    {total_stats['mean']:.3f} ± {total_stats['std']:.3f} ms")
-            print(f"  Throughput: {tokens_per_second_total/1e6:.2f}M tokens/s, {samples_per_second_total:.2f} samples/s")
+            print(f"  Forward-only: {forward_only_stats['mean']:.3f} ± {forward_only_stats['std']:.3f} ms")
+            print(f"    Throughput: {tokens_per_second_forward_only/1e6:.2f}M tokens/s, {samples_per_second_forward_only:.2f} samples/s")
+            print(f"  Forward+Backward:")
+            print(f"    Forward:  {forward_stats['mean']:.3f} ± {forward_stats['std']:.3f} ms")
+            print(f"    Backward: {backward_stats['mean']:.3f} ± {backward_stats['std']:.3f} ms")
+            print(f"    Total:    {total_stats['mean']:.3f} ± {total_stats['std']:.3f} ms")
+            print(f"    Throughput: {tokens_per_second_total/1e6:.2f}M tokens/s, {samples_per_second_total:.2f} samples/s")
 
         dist.barrier()
         # Final cleanup - cache clearing already done in benchmark_backward
@@ -363,9 +397,32 @@ def benchmark_all_methods(
         baseline_bwd = results["naive"]["backward"]["mean"]
         baseline_total = results["naive"]["total"]["mean"]
 
-        # Print header
-        print(f"{'Method':<20} {'Total (ms)':<15} {'Throughput':<25} {'Speedup':<10}")
-        print(f"{'':20} {'':15} {'(Tokens/s)':<25} {'':10}")
+        # Print header for Forward-only throughput
+        print("FORWARD-ONLY THROUGHPUT:")
+        print(f"{'Method':<20} {'Time (ms)':<15} {'Throughput':<30} {'Speedup':<10}")
+        print(f"{'':20} {'':15} {'(Tokens/s)':<30} {'':10}")
+        print("-" * 90)
+        
+        baseline_forward_only = results["naive"]["forward_only"]["mean"]
+        
+        for method_name in methods.keys():
+            res = results[method_name]
+            fwd_only_mean = res["forward_only"]["mean"]
+            fwd_only_std = res["forward_only"]["std"]
+            
+            tokens_per_sec_fwd = res["throughput"]["forward_only"]["tokens_per_second"]
+            samples_per_sec_fwd = res["throughput"]["forward_only"]["samples_per_second"]
+            
+            speedup_fwd = baseline_forward_only / fwd_only_mean if fwd_only_mean > 0 else 0.0
+            
+            throughput_str_fwd = f"{tokens_per_sec_fwd/1e6:.2f}M tok/s, {samples_per_sec_fwd:.2f} samp/s"
+
+            print(f"{method_name:<20} {fwd_only_mean:>7.3f} ± {fwd_only_std:<5.3f}   {throughput_str_fwd:<30} {speedup_fwd:>6.2f}x")
+        
+        print()
+        print("FORWARD+BACKWARD THROUGHPUT:")
+        print(f"{'Method':<20} {'Total (ms)':<15} {'Throughput':<30} {'Speedup':<10}")
+        print(f"{'':20} {'':15} {'(Tokens/s)':<30} {'':10}")
         print("-" * 90)
 
         # Print each method
@@ -381,7 +438,7 @@ def benchmark_all_methods(
             
             throughput_str = f"{tokens_per_sec/1e6:.2f}M tok/s, {samples_per_sec:.2f} samp/s"
 
-            print(f"{method_name:<20} {total_mean:>7.3f} ± {total_std:<5.3f}   {throughput_str:<25} {speedup:>6.2f}x")
+            print(f"{method_name:<20} {total_mean:>7.3f} ± {total_std:<5.3f}   {throughput_str:<30} {speedup:>6.2f}x")
         
         print()
         print("Detailed Timing Breakdown:")
@@ -408,25 +465,33 @@ def benchmark_all_methods(
         for method_name in methods.keys():
             res = results[method_name]
             print(f"\n{method_name}:")
-            print(f"  Forward:  mean={res['forward']['mean']:.3f} ms, "
+            print(f"  Forward-only:")
+            print(f"    Time:     mean={res['forward_only']['mean']:.3f} ms, "
+                  f"median={res['forward_only']['median']:.3f} ms, "
+                  f"std={res['forward_only']['std']:.3f} ms, "
+                  f"min={res['forward_only']['min']:.3f} ms, "
+                  f"max={res['forward_only']['max']:.3f} ms")
+            print(f"    Throughput: {res['throughput']['forward_only']['tokens_per_second']/1e6:.2f}M tokens/s, {res['throughput']['forward_only']['samples_per_second']:.2f} samples/s")
+            print(f"  Forward+Backward:")
+            print(f"    Forward:  mean={res['forward']['mean']:.3f} ms, "
                   f"median={res['forward']['median']:.3f} ms, "
                   f"std={res['forward']['std']:.3f} ms, "
                   f"min={res['forward']['min']:.3f} ms, "
                   f"max={res['forward']['max']:.3f} ms")
-            print(f"  Backward: mean={res['backward']['mean']:.3f} ms, "
+            print(f"    Backward: mean={res['backward']['mean']:.3f} ms, "
                   f"median={res['backward']['median']:.3f} ms, "
                   f"std={res['backward']['std']:.3f} ms, "
                   f"min={res['backward']['min']:.3f} ms, "
                   f"max={res['backward']['max']:.3f} ms")
-            print(f"  Total:    mean={res['total']['mean']:.3f} ms, "
+            print(f"    Total:    mean={res['total']['mean']:.3f} ms, "
                   f"median={res['total']['median']:.3f} ms, "
                   f"std={res['total']['std']:.3f} ms, "
                   f"min={res['total']['min']:.3f} ms, "
                   f"max={res['total']['max']:.3f} ms")
-            print(f"  Throughput:")
-            print(f"    Forward:  {res['throughput']['tokens_per_second']['forward']/1e6:.2f}M tokens/s, {res['throughput']['samples_per_second']['forward']:.2f} samples/s")
-            print(f"    Backward: {res['throughput']['tokens_per_second']['backward']/1e6:.2f}M tokens/s, {res['throughput']['samples_per_second']['backward']:.2f} samples/s")
-            print(f"    Total:    {res['throughput']['tokens_per_second']['total']/1e6:.2f}M tokens/s, {res['throughput']['samples_per_second']['total']:.2f} samples/s")
+            print(f"    Throughput:")
+            print(f"      Forward:  {res['throughput']['tokens_per_second']['forward']/1e6:.2f}M tokens/s, {res['throughput']['samples_per_second']['forward']:.2f} samples/s")
+            print(f"      Backward: {res['throughput']['tokens_per_second']['backward']/1e6:.2f}M tokens/s, {res['throughput']['samples_per_second']['backward']:.2f} samples/s")
+            print(f"      Total:    {res['throughput']['tokens_per_second']['total']/1e6:.2f}M tokens/s, {res['throughput']['samples_per_second']['total']:.2f} samples/s")
 
         print("="*80)
 
