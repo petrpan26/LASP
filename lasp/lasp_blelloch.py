@@ -154,7 +154,18 @@ class LaspBlelloch(torch.autograd.Function):
             )
 
             # Blelloch scan: O(log P) tree communication
-            KV_prefix = scanner.scan(local_kv)
+            # IMPORTANT: Blelloch returns INCLUSIVE prefix (includes current rank)
+            # but LASP needs EXCLUSIVE prefix (only previous ranks)
+            KV_prefix_inclusive = scanner.scan(local_kv)
+
+            # Convert inclusive to exclusive by subtracting current rank's contribution
+            if rank > 0:
+                # For rank i: exclusive_prefix = inclusive_prefix - local_kv
+                # This gives us sum(kv[0:i]) instead of sum(kv[0:i+1])
+                KV_prefix = KV_prefix_inclusive - local_kv
+            else:
+                # Rank 0 has no previous ranks, so prefix is zero
+                KV_prefix = torch.zeros_like(KV_prefix_inclusive)
 
         # ===== STEP 4: Inter-chunk attention using fused kernel =====
         # This is the key improvement: use _fwd_none_diag_kernel instead of torch.matmul
@@ -280,7 +291,17 @@ class LaspBlelloch(torch.autograd.Function):
             )
 
             # Reverse scan for gradients
-            DKV_suffix = scanner.scan(local_dkv)
+            # IMPORTANT: Blelloch returns INCLUSIVE suffix (includes current rank)
+            # but LASP needs EXCLUSIVE suffix (only future ranks)
+            DKV_suffix_inclusive = scanner.scan(local_dkv)
+
+            # Convert inclusive to exclusive
+            if rank < world_size - 1:
+                # For reversed rank i: exclusive_suffix = inclusive_suffix - local_dkv
+                DKV_suffix = DKV_suffix_inclusive - local_dkv
+            else:
+                # Last rank (which is rank 0 in forward) has no future ranks
+                DKV_suffix = torch.zeros_like(DKV_suffix_inclusive)
 
         # ===== STEP 4: Inter-chunk gradient contribution using fused kernel =====
         with torch.cuda.device(q.device.index):
