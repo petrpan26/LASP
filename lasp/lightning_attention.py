@@ -2,6 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .gpu_config import get_config_for_kernel
+
 
 @triton.jit
 def _fwd_kernel(
@@ -405,10 +407,11 @@ class LightningAttention(torch.autograd.Function):
         e = v.shape[-1]
         o = torch.empty((b, h, n, e), dtype=q.dtype, device=q.device)
 
-        BLOCK = 64
+        # Get optimal block sizes based on GPU architecture
+        config = get_config_for_kernel('lightning', n, d, e, q.device)
+        BLOCK = config['BLOCK']
+        BLOCK_MODEL = config['BLOCK_MODEL']
         NUM_BLOCK = triton.cdiv(q.shape[2], BLOCK)
-        # parallel over channel
-        BLOCK_MODEL = min(triton.next_power_of_2(e), 32)
         grid = (b * h, triton.cdiv(e, BLOCK_MODEL))
 
         with torch.cuda.device(q.device.index):
@@ -449,11 +452,11 @@ class LightningAttention(torch.autograd.Function):
         b, h, n, d = q.shape
         e = v.shape[-1]
 
-        # block size
-        BLOCK = 64
+        # Get optimal block sizes based on GPU architecture
+        config = get_config_for_kernel('lightning', n, d, e, q.device)
+        BLOCK = config['BLOCK']
+        CBLOCK = config['CBLOCK']
         NUM_BLOCK = triton.cdiv(n, BLOCK)
-        # compute block size
-        CBLOCK = 32
         NUM_CBLOCK = BLOCK // CBLOCK
 
         with torch.cuda.device(q.device.index):

@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 import triton
 
+from .gpu_config import get_config_for_kernel
 from .lasp_fuse_parallel import (
     _fwd_diag_kernel,
     _fwd_kv_parallel,
@@ -72,13 +73,10 @@ class LaspBlelloch(torch.autograd.Function):
         rank = get_sequence_parallel_rank()
         world_size = get_sequence_parallel_world_size()
 
-        # Determine block sizes (same logic as lasp_fuse_parallel)
-        if n > 128:
-            BLOCK = 256
-            CBLOCK = 64
-        else:
-            BLOCK = min(n, 128)
-            CBLOCK = min(n, 64)
+        # Determine block sizes based on GPU architecture
+        config = get_config_for_kernel('lasp_blelloch', n, d, e, q.device)
+        BLOCK = config['BLOCK']
+        CBLOCK = config['CBLOCK']
 
         NUM_BLOCK = n // BLOCK
         NUM_CBLOCK = BLOCK // CBLOCK

@@ -3,6 +3,7 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 
+from .gpu_config import get_config_for_kernel
 from .utils import (
     get_seq_parallel_receive_rank,
     get_seq_parallel_send_rank,
@@ -371,8 +372,9 @@ def lasp_forward(q, k, v, s, KV):
     # right
     o = torch.empty((nd, b, h, n, e), dtype=q.dtype, device=q.device)
 
-    BLOCK = 64
-
+    # Get optimal block sizes based on GPU architecture
+    config = get_config_for_kernel('lasp_fuse', n, d, e, q.device)
+    BLOCK = config['BLOCK']
     NUM_BLOCK = q.shape[2] // BLOCK
 
     grid = (nd, ne, b * h)
@@ -417,7 +419,10 @@ def lasp_backward(q, k, v, s, do, KV, DKV):
 
     b, h, n, d = q.shape
     e = v.shape[-1]
-    BLOCK = 32
+
+    # Get optimal block sizes based on GPU architecture
+    config = get_config_for_kernel('lasp_fuse', n, d, e, q.device)
+    BLOCK = config['BLOCK']
     NUM_BLOCK = triton.cdiv(n, BLOCK)
 
     cd = 64
