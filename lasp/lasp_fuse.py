@@ -1,3 +1,18 @@
+"""
+LASP Fused Kernels Implementation
+
+This file contains optimized fused kernels for LASP attention:
+- LaspFuse (V1): Ring-based P2P communication
+- LaspFuseV2 (LASP-2): AllGather-based implementation
+
+Recent fixes:
+1. NUM_BLOCK calculation: Changed from floor division to ceiling division
+   (triton.cdiv) to correctly handle non-divisible sequence lengths
+2. LaspFuseV2 G array: Extended to world_size + 1 elements to prevent
+   IndexError when computing decay weights for the last rank
+3. Gamma calculation: Use actual sequence length n instead of padded length
+"""
+
 import torch
 import torch.distributed as dist
 import triton
@@ -375,7 +390,8 @@ def lasp_forward(q, k, v, s, KV):
     # Get optimal block sizes based on GPU architecture
     config = get_config_for_kernel('lasp_fuse', n, d, e, q.device)
     BLOCK = config['BLOCK']
-    NUM_BLOCK = q.shape[2] // BLOCK
+    # Use ceiling division to handle partial blocks correctly
+    NUM_BLOCK = triton.cdiv(n, BLOCK)
 
     grid = (nd, ne, b * h)
 
@@ -696,8 +712,8 @@ class LaspFuseV2(torch.autograd.Function):
         # Get config
         config = get_config_for_kernel('lasp_fuse', n, d, e, q.device)
         BLOCK = config['BLOCK']
-        # Use floor division like V1 to avoid tail handling in kernel
-        NUM_BLOCK = n // BLOCK
+        # Use ceiling division to handle partial blocks correctly
+        NUM_BLOCK = triton.cdiv(n, BLOCK)
 
         # Use same caps as V1 to ensure nd, ne >= 1
         # Otherwise if d=768, next_power_of_2=1024 → nd=0 → invalid grid
@@ -717,8 +733,8 @@ class LaspFuseV2(torch.autograd.Function):
         # Step 2: Compute per-rank gamma = exp(-s * n_local)
         # This is the cumulative decay across this rank's local chunk
         # Shape: [H] → broadcast to [1, H, 1, 1] for element-wise ops
-        n_local = NUM_BLOCK * BLOCK  # Actual processed sequence length
-        gamma_local = torch.exp(-s.to(torch.float32) * n_local).to(local_KV.dtype).view(1, h, 1, 1)
+        # Use actual sequence length, not padded length
+        gamma_local = torch.exp(-s.to(torch.float32) * n).to(local_KV.dtype).view(1, h, 1, 1)
 
         # Step 3: AllGather gamma and KV from all ranks with stream overlap
         gamma_list = [torch.empty_like(gamma_local) for _ in range(world_size)]
@@ -739,8 +755,9 @@ class LaspFuseV2(torch.autograd.Function):
         # Step 4: Compute decay-weighted exclusive prefix
         # Prefix for rank r: sum_{i<r} (prod_{t=i+1..r} gamma[t]) * local_KV[i]
         # First compute prefix products G[r] = prod_{t=0..r-1} gamma[t]
+        # Need world_size + 1 elements to handle all decay computations
         G = [torch.ones_like(gamma_local)]
-        for r in range(1, world_size):
+        for r in range(1, world_size + 1):  # Extended to world_size + 1
             G.append(G[-1] * gamma_list[r - 1])
 
         # Compute decay-weighted prefix sum
@@ -785,8 +802,8 @@ class LaspFuseV2(torch.autograd.Function):
         e = v.shape[-1]
 
         BLOCK = config['BLOCK']
-        # Use floor division like forward to match
-        NUM_BLOCK = n // BLOCK
+        # Use ceiling division to handle partial blocks correctly
+        NUM_BLOCK = triton.cdiv(n, BLOCK)
 
         # Use same tile caps as forward
         cd = 64
@@ -839,7 +856,8 @@ class LaspFuseV2(torch.autograd.Function):
             for i in range(current_idx + 1, world_size):
                 # Weight for DKV from rank i at rank current_idx is G[i+1] / G[current_idx+1]
                 # (where G[r] = prod_{t=0..r-1} gamma[t])
-                weight = G[i + 1] / G[current_idx + 1] if current_idx + 1 < len(G) else torch.ones_like(gamma_list[0])
+                # Now G has world_size + 1 elements, so G[i+1] is always valid for i < world_size
+                weight = G[i + 1] / G[current_idx + 1]
                 DKV_suffix = DKV_suffix + weight * DKV_list[i]
         else:
             DKV_suffix = torch.zeros_like(local_DKV)
