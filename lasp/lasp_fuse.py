@@ -10,7 +10,8 @@ Recent fixes:
    (triton.cdiv) to correctly handle non-divisible sequence lengths
 2. LaspFuseV2 G array: Extended to world_size + 1 elements to prevent
    IndexError when computing decay weights for the last rank
-3. Gamma calculation: Use actual sequence length n instead of padded length
+3. Gamma calculation: Uses padded length (NUM_BLOCK * BLOCK) for consistency
+   with kernel processing when handling partial blocks
 """
 
 import torch
@@ -733,8 +734,9 @@ class LaspFuseV2(torch.autograd.Function):
         # Step 2: Compute per-rank gamma = exp(-s * n_local)
         # This is the cumulative decay across this rank's local chunk
         # Shape: [H] → broadcast to [1, H, 1, 1] for element-wise ops
-        # Use actual sequence length, not padded length
-        gamma_local = torch.exp(-s.to(torch.float32) * n).to(local_KV.dtype).view(1, h, 1, 1)
+        # Use padded length for consistency with kernel processing
+        n_local = NUM_BLOCK * BLOCK
+        gamma_local = torch.exp(-s.to(torch.float32) * n_local).to(local_KV.dtype).view(1, h, 1, 1)
 
         # Step 3: AllGather gamma and KV from all ranks with stream overlap
         gamma_list = [torch.empty_like(gamma_local) for _ in range(world_size)]
@@ -765,7 +767,8 @@ class LaspFuseV2(torch.autograd.Function):
             KV_prefix = torch.zeros_like(local_KV)
             for i in range(current_idx):
                 # Weight for KV from rank i at rank current_idx is G[current_idx] / G[i+1]
-                weight = G[current_idx] / G[i + 1] if i + 1 < len(G) else G[current_idx]
+                # Add small epsilon for numerical stability
+                weight = G[current_idx] / (G[i + 1] + 1e-10)
                 KV_prefix = KV_prefix + weight * KV_list[i]
         else:
             # Rank 0 has no prefix
@@ -857,7 +860,8 @@ class LaspFuseV2(torch.autograd.Function):
                 # Weight for DKV from rank i at rank current_idx is G[i+1] / G[current_idx+1]
                 # (where G[r] = prod_{t=0..r-1} gamma[t])
                 # Now G has world_size + 1 elements, so G[i+1] is always valid for i < world_size
-                weight = G[i + 1] / G[current_idx + 1]
+                # Add small epsilon for numerical stability
+                weight = G[i + 1] / (G[current_idx + 1] + 1e-10)
                 DKV_suffix = DKV_suffix + weight * DKV_list[i]
         else:
             DKV_suffix = torch.zeros_like(local_DKV)
