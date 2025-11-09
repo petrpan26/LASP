@@ -34,6 +34,42 @@ def get_seq_parallel_receive_rank():
     return (rank + 1 + world_size) % world_size
 
 
+def get_blelloch_partner_rank(rank: int, level: int, phase: str, world_size: int) -> int:
+    """
+    Compute communication partner for Blelloch scan at given tree level.
+
+    Args:
+        rank: Current GPU rank
+        level: Tree level (0 to log2(world_size)-1)
+        phase: 'up' for up-sweep, 'down' for down-sweep
+        world_size: Total number of GPUs
+
+    Returns:
+        Partner rank, or -1 if no communication needed at this level
+    """
+    stride = 2 ** level
+
+    if phase == 'up':
+        if rank % (2 * stride) == 0:
+            partner = rank + stride
+            return partner if partner < world_size else -1
+        elif rank % (2 * stride) == stride:
+            return rank - stride
+        else:
+            return -1  # Inactive at this level
+
+    elif phase == 'down':
+        if rank % (2 * stride) == stride:
+            return rank - stride
+        elif rank % (2 * stride) == 0:
+            partner = rank + stride
+            return partner if partner < world_size else -1
+        else:
+            return -1
+
+    raise ValueError(f"Unknown phase: {phase}")
+
+
 def initialize_lasp(
     data_parallel_size: int = 1,
     sequence_parallel_size: int = 1,

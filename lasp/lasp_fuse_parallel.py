@@ -3,6 +3,7 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 
+from .gpu_config import get_config_for_kernel
 from .utils import (
     get_seq_parallel_receive_rank,
     get_seq_parallel_send_rank,
@@ -830,7 +831,7 @@ def _bwd_none_diag_kernel(
     tl.store(DV_block_ptr, dv.to(DV_block_ptr.dtype.element_ty))
 
 
-def lasp_forward(q, k, v, s, KV, BLOCK=128, CBLOCK=64):
+def lasp_forward(q, k, v, s, KV, BLOCK=64, CBLOCK=32):
     q = q.contiguous()
     k = k.contiguous()
     v = v.contiguous()
@@ -944,7 +945,7 @@ def lasp_forward(q, k, v, s, KV, BLOCK=128, CBLOCK=64):
     return o, kv, KV
 
 
-def lasp_backward(q, k, v, s, do, kv, KV, DKV, BLOCK=128, CBLOCK=64):
+def lasp_backward(q, k, v, s, do, kv, KV, DKV, BLOCK=64, CBLOCK=32):
     q = q.contiguous()
     k = k.contiguous()
     v = v.contiguous()
@@ -1075,14 +1076,12 @@ class LaspFuseParallel(torch.autograd.Function):
     def forward(ctx, q, k, v, s, KV, DKV):
         # s: (h, 1, 1)
         b, h, n, d = q.shape
-        v.shape[-1]
+        e = v.shape[-1]
 
-        if n > 128:
-            BLOCK = 256
-            CBLOCK = 64
-        else:
-            BLOCK = min(n, 128)
-            CBLOCK = min(n, 64)
+        # Get optimal block sizes based on GPU architecture
+        config = get_config_for_kernel('lasp_fuse_parallel', n, d, e, q.device)
+        BLOCK = config['BLOCK']
+        CBLOCK = config['CBLOCK']
 
         KV.zero_()
 
