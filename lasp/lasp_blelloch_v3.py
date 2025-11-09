@@ -90,12 +90,12 @@ class _PipelinedTreeScanner:
         self.device = device
         self.reverse = reverse
         self.num_slices = max(1, int(num_slices))
-        self.cs = comm_stream if comm_stream is not None else torch.cuda.current_stream()
+        # Ensure stream is created on the target device
+        with torch.cuda.device(device):
+            self.cs = comm_stream if comm_stream is not None else torch.cuda.Stream(priority=-1)
 
-        # Map local SP ranks to global ranks for P2P as in ZeCO
+        # Group-local rank within the SP group
         self.local_rank = dist.get_rank(group)
-        self.global_rank = dist.get_rank()
-        self.rank_offset = self.global_rank - self.local_rank
 
         # Reverse scan rank space if suffix is requested
         self.scan_rank = (world_size - 1 - self.local_rank) if reverse else self.local_rank
@@ -113,51 +113,54 @@ class _PipelinedTreeScanner:
         return 2 ** level
 
     def _partner_up(self, level: int) -> int:
-        stride = self._stride(level)
-        if self.scan_rank % (2 * stride) == stride - 1:
-            partner = self.scan_rank + stride
+        # Canonical Blelloch (up-sweep):
+        # senders:   i % (2*s) == s-1  → send to i+s
+        # receivers: i % (2*s) == 2*s-1 → recv from i-s
+        s = self._stride(level)
+        i = self.scan_rank
+        if i % (2 * s) == s - 1:
+            partner = i + s
             return partner if partner < self.world_size else -1
-        if self.scan_rank % (2 * stride) == 2 * stride - 1:
-            return self.scan_rank - stride
+        if i % (2 * s) == 2 * s - 1:
+            partner = i - s
+            return partner if partner >= 0 else -1
         return -1
 
     def _is_sender_up(self, level: int) -> bool:
-        stride = self._stride(level)
-        return self.scan_rank % (2 * stride) == stride - 1
+        s = self._stride(level)
+        return self.scan_rank % (2 * s) == s - 1
 
     def _is_receiver_up(self, level: int) -> bool:
-        stride = self._stride(level)
-        return self.scan_rank % (2 * stride) == 2 * stride - 1
+        s = self._stride(level)
+        return self.scan_rank % (2 * s) == 2 * s - 1
 
     def _partner_down(self, level: int) -> int:
-        stride = self._stride(level)
-        if self.scan_rank % (2 * stride) == stride - 1:
-            partner = self.scan_rank + 1  # right subtree middle
+        # Canonical Blelloch (down-sweep):
+        # senders:   i % (2*s) == s-1  → send to i+1 (middle of right subtree)
+        # receivers: i % (2*s) == s    → recv from i-1
+        s = self._stride(level)
+        i = self.scan_rank
+        if i % (2 * s) == s - 1:
+            partner = i + 1
             return partner if partner < self.world_size else -1
-        if self.scan_rank % (2 * stride) == stride:
-            return self.scan_rank - 1
+        if i % (2 * s) == s:
+            partner = i - 1
+            return partner if partner >= 0 else -1
         return -1
 
     def _is_sender_down(self, level: int) -> bool:
-        stride = self._stride(level)
-        return self.scan_rank % (2 * stride) == stride - 1
+        s = self._stride(level)
+        return self.scan_rank % (2 * s) == s - 1
 
     def _is_receiver_down(self, level: int) -> bool:
-        stride = self._stride(level)
-        return self.scan_rank % (2 * stride) == stride
+        s = self._stride(level)
+        return self.scan_rank % (2 * s) == s
 
-    def _scan_to_global(self, scan_rank: int) -> int:
+    def _scan_to_actual(self, scan_rank: int) -> int:
+        """Map scan-space rank to actual group-local rank."""
         if scan_rank < 0:
             return -1
-        if self.reverse:
-            actual_local = self.world_size - 1 - scan_rank
-            return actual_local + self.rank_offset
-        return scan_rank + self.rank_offset
-
-    def _actual_to_global(self, actual_local: int) -> int:
-        if actual_local < 0:
-            return -1
-        return actual_local + self.rank_offset
+        return (self.world_size - 1 - scan_rank) if self.reverse else scan_rank
 
     def _combine(self, recv: torch.Tensor, local: torch.Tensor, level: int) -> torch.Tensor:
         """
@@ -191,7 +194,8 @@ class _PipelinedTreeScanner:
                 tree_values.append(None)
                 continue
 
-            partner_global = self._scan_to_global(partner_scan)
+            actual_partner = self._scan_to_actual(partner_scan)
+            partner_global = dist.get_global_rank(self.group, actual_partner) if actual_partner >= 0 else -1
 
             # Use comm stream for P2P ops
             with torch.cuda.stream(self.cs):
@@ -213,12 +217,21 @@ class _PipelinedTreeScanner:
                         tree_values.append(None)
 
                 elif self._is_receiver_up(level):
-                    # Receive partner slices and combine on the fly
-                    for i, (s, w) in enumerate(zip(starts, sizes)):
-                        recv_buf = torch.empty((b, h, w, e), dtype=working.dtype, device=working.device)
-                        req = dist.irecv(tensor=recv_buf, src=partner_global, group=self.group)
-                        req.wait()
-                        combined = self._combine(recv_buf, working[:, :, s:s + w, :], level)
+                    # Receive partner slices and combine (batch non-blocking)
+                    recv_bufs = [
+                        torch.empty((b, h, w, e), dtype=working.dtype, device=working.device)
+                        for (s, w) in zip(starts, sizes)
+                    ]
+                    ops = [
+                        dist.P2POp(dist.irecv, recv_bufs[i], src=partner_global, group=self.group)
+                        for i in range(len(recv_bufs))
+                    ]
+                    reqs = dist.batch_isend_irecv(ops)
+                    for r in reqs:
+                        r.wait()
+                    for (i, (s, w)) in enumerate(zip(starts, sizes)):
+                        recv_bufs[i].record_stream(self.cs)
+                        combined = self._combine(recv_bufs[i], working[:, :, s:s + w, :], level)
                         working[:, :, s:s + w, :].copy_(combined)
                     # Always store updated value for down-sweep needs
                     tree_values.append(working.clone())
@@ -229,7 +242,8 @@ class _PipelinedTreeScanner:
             partner_scan = self._partner_down(level)
             if partner_scan == -1:
                 continue
-            partner_global = self._scan_to_global(partner_scan)
+            actual_partner = self._scan_to_actual(partner_scan)
+            partner_global = dist.get_global_rank(self.group, actual_partner) if actual_partner >= 0 else -1
 
             with torch.cuda.stream(self.cs):
                 if self._is_receiver_down(level) and partner_scan >= 0:
@@ -241,14 +255,21 @@ class _PipelinedTreeScanner:
                         tree_idx -= 1
                         tree_val = tree_values[tree_idx]
                     # Combine per slice
-                    for i, (s, w) in enumerate(zip(starts, sizes)):
-                        left_slice = torch.empty((b, h, w, e), dtype=working.dtype, device=working.device)
-                        req = dist.irecv(tensor=left_slice, src=partner_global, group=self.group)
-                        req.wait()
+                    left_slices = [
+                        torch.empty((b, h, w, e), dtype=working.dtype, device=working.device)
+                        for (s, w) in zip(starts, sizes)
+                    ]
+                    ops = [
+                        dist.P2POp(dist.irecv, left_slices[i], src=partner_global, group=self.group)
+                        for i in range(len(left_slices))
+                    ]
+                    reqs = dist.batch_isend_irecv(ops)
+                    for r in reqs:
+                        r.wait()
+                    for (i, (s, w)) in enumerate(zip(starts, sizes)):
+                        left_slices[i].record_stream(self.cs)
                         base_slice = tree_val[:, :, s:s + w, :] if tree_val is not None else working[:, :, s:s + w, :]
-                        # Distance equals actual separation in scan order
-                        # Use level as stride proxy (2^level)
-                        combined = self._combine(left_slice, base_slice, level)
+                        combined = self._combine(left_slices[i], base_slice, level)
                         working[:, :, s:s + w, :].copy_(combined)
                     inclusive_ready = True
 
@@ -280,17 +301,19 @@ class _PipelinedTreeScanner:
         with torch.cuda.stream(self.cs):
             if not self.reverse:
                 # Prefix: recv from left neighbor (rank-1), send to right neighbor (rank+1)
-                recv_req = None
-                send_req = None
                 if self.local_rank > 0:
-                    left_global = self._actual_to_global(self.local_rank - 1)
-                    # Receive d-slices
-                    for s, w in zip(starts, sizes):
-                        buf = exclusive[:, :, s:s + w, :]
-                        req = dist.irecv(tensor=buf, src=left_global, group=self.group)
-                        req.wait()
+                    left_global = dist.get_global_rank(self.group, self.local_rank - 1)
+                    # Receive all d-slices as a batch
+                    recv_bufs = [exclusive[:, :, s:s + w, :] for (s, w) in zip(starts, sizes)]
+                    ops = [
+                        dist.P2POp(dist.irecv, recv_bufs[i], src=left_global, group=self.group)
+                        for i in range(len(recv_bufs))
+                    ]
+                    reqs = dist.batch_isend_irecv(ops)
+                    for r in reqs:
+                        r.wait()
                 if self.local_rank < self.world_size - 1:
-                    right_global = self._actual_to_global(self.local_rank + 1)
+                    right_global = dist.get_global_rank(self.group, self.local_rank + 1)
                     # Send our inclusive in d-slices
                     send_reqs = []
                     for s, w in zip(starts, sizes):
@@ -304,13 +327,17 @@ class _PipelinedTreeScanner:
             else:
                 # Suffix: recv from right neighbor (rank+1), send to left neighbor (rank-1)
                 if self.local_rank < self.world_size - 1:
-                    right_global = self._actual_to_global(self.local_rank + 1)
-                    for s, w in zip(starts, sizes):
-                        buf = exclusive[:, :, s:s + w, :]
-                        req = dist.irecv(tensor=buf, src=right_global, group=self.group)
-                        req.wait()
+                    right_global = dist.get_global_rank(self.group, self.local_rank + 1)
+                    recv_bufs = [exclusive[:, :, s:s + w, :] for (s, w) in zip(starts, sizes)]
+                    ops = [
+                        dist.P2POp(dist.irecv, recv_bufs[i], src=right_global, group=self.group)
+                        for i in range(len(recv_bufs))
+                    ]
+                    reqs = dist.batch_isend_irecv(ops)
+                    for r in reqs:
+                        r.wait()
                 if self.local_rank > 0:
-                    left_global = self._actual_to_global(self.local_rank - 1)
+                    left_global = dist.get_global_rank(self.group, self.local_rank - 1)
                     send_reqs = []
                     for s, w in zip(starts, sizes):
                         src_slice = working[:, :, s:s + w, :].contiguous()
@@ -348,7 +375,8 @@ class LaspBlellochV3(torch.autograd.Function):
         CBLOCK = config['CBLOCK']
 
         # Use cdiv for robustness on tail blocks
-        NUM_BLOCK = triton.cdiv(n, BLOCK)
+        # Use floor division to match kernel expectations (masking tails not guaranteed)
+        NUM_BLOCK = n // BLOCK
         NUM_CBLOCK = BLOCK // CBLOCK
         NUM_FBLOCK = 1
         D_FBLOCK = d // NUM_FBLOCK
