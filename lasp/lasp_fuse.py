@@ -880,8 +880,10 @@ class LaspFuseV2(torch.autograd.Function):
         if current_idx < world_size - 1:
             for j in range(current_idx + 1, world_size):
                 # Weight for gradient from rank j flowing back to current rank
-                # Use gamma^(j-r-1) since the kernel will apply one more decay
-                # After kernel: gamma * gamma^(j-r-1) = gamma^(j-r) ✓
+                # In v1: rank j sends (exp(-s*n_local) * received + local_dkv_j)
+                # Rank r receives: sum of local_dkv from successors with appropriate decay
+                # For immediate successor (j=r+1): no decay (the kernel already applied it)
+                # For j: decay by gamma^(j - r - 1)
                 weight = G[j] / (G[current_idx + 1] + 1e-10)
                 incoming_dM = incoming_dM + weight * dM_list[j]
 
