@@ -7,6 +7,7 @@ from einops import rearrange
 
 from lasp import (
     lasp_blelloch,
+    lasp_blelloch_v2,
     lasp_cache,
     lasp_fuse,
     lasp_fuse_parallel,
@@ -97,6 +98,7 @@ def test(dp_size, benchmark=False, num_trials=100, num_warmup=10):
         "zeco": lasp_zeco,
         "fuse_parallel": lasp_fuse_parallel,
         "blelloch": lasp_blelloch,
+        "blelloch_v2": lasp_blelloch_v2,
     }
 
     # Storage for benchmark results
