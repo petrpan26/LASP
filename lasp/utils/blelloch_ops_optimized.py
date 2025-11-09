@@ -387,7 +387,7 @@ class BlellochScannerOptimized:
             for i in range(self.true_blocks):
                 if self.is_sender(level, 'down') and partner < self.world_size:
                     work_send[i] = dist.isend(
-                        tensor=self._level_buffers[level][i].contiguous(),
+                        tensor=self._level_buffers[level + 1][i].contiguous(),
                         dst=global_partner,
                         group=self.group
                     )
@@ -397,8 +397,8 @@ class BlellochScannerOptimized:
 
                     self.combine_block_inplace(
                         self._recv_buffers[level][i],
-                        self._level_buffers[level][i],
-                        self._level_buffers[level][i],
+                        self._level_buffers[level + 1][i],
+                        self._level_buffers[level + 1][i],
                         distance
                     )
 
