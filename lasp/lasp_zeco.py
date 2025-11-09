@@ -307,6 +307,8 @@ def all_scan_p2p(
                 work_recv[nxt] = dist.irecv(tensor=recv_bufs[nxt], src=recv_from, group=group)
 
         # Wait for all sends to complete before buffers go out of scope
+        # Note: record_stream() calls ensure CUDA ops complete before sends finish
+        # DO NOT add cs.synchronize() here - it causes deadlock in chain topology!
         for w in work_send:
             if w is not None:
                 w.wait()
@@ -367,16 +369,18 @@ class LaspZeCo(torch.autograd.Function):
 
         # Step 3: Launch All-Scan on comm stream (forward direction)
         # This runs asynchronously while we could do local intra-chunk work
+        # NOTE: all_scan_p2p manages its own stream context internally
+        S_pred, S_out = all_scan_p2p(
+            S_local=local_KV,
+            gamma_tilde=gamma_tilde_expanded,
+            group=group,
+            direction="fwd",
+            num_blocks=num_blocks,
+            comm_stream=comm_stream,
+        )
+        # Record completion event in the comm stream
         with torch.cuda.stream(comm_stream):
-            S_pred, S_out = all_scan_p2p(
-                S_local=local_KV,
-                gamma_tilde=gamma_tilde_expanded,
-                group=group,
-                direction="fwd",
-                num_blocks=num_blocks,
-                comm_stream=comm_stream,
-            )
-            comm_done.record(comm_stream)
+            comm_done.record()
 
         # Step 4: Wait for All-Scan to complete before computing local attention
         # NOTE: Future optimization could overlap local computation with All-Scan
@@ -443,16 +447,18 @@ class LaspZeCo(torch.autograd.Function):
         # Fix: Pass the actual computed dKV_local, not zeros!
         gamma_tilde_expanded = gamma_tilde.unsqueeze(-1)
 
+        # NOTE: all_scan_p2p manages its own stream context internally
+        dKV_pred, dKV_out = all_scan_p2p(
+            S_local=dKV_local,
+            gamma_tilde=gamma_tilde_expanded,
+            group=group,
+            direction="bwd",  # Reverse direction for backward pass
+            num_blocks=num_blocks,
+            comm_stream=comm_stream,
+        )
+        # Record completion event in the comm stream
         with torch.cuda.stream(comm_stream):
-            dKV_pred, dKV_out = all_scan_p2p(
-                S_local=dKV_local,
-                gamma_tilde=gamma_tilde_expanded,
-                group=group,
-                direction="bwd",  # Reverse direction for backward pass
-                num_blocks=num_blocks,
-                comm_stream=comm_stream,
-            )
-            comm_done.record(comm_stream)
+            comm_done.record()
 
         # Wait for backward All-Scan
         torch.cuda.current_stream().wait_event(comm_done)

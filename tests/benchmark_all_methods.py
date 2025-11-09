@@ -43,27 +43,32 @@ def clear_cache():
     torch.cuda.synchronize()
 
 
-def benchmark_forward(run_fn, num_trials=100, num_warmup=10):
+def benchmark_forward(run_fn, num_trials=100, num_warmup=10, rank=0):
     """Benchmark forward pass only."""
     times = []
 
     # Clear cache once before warmup
     clear_cache()
     dist.barrier()
-    
+
     # Warmup
-    for _ in range(num_warmup):
+    for i in range(num_warmup):
+        if rank == 0 and i == 0:
+            print(f"    Warmup...", flush=True)
         _ = run_fn()
-    
+
     torch.cuda.synchronize()
     dist.barrier()
-    
+
     # Clear cache once before benchmarking
     clear_cache()
     dist.barrier()
 
     # Benchmark
-    for _ in range(num_trials):
+    for i in range(num_trials):
+        if rank == 0 and i % 20 == 0:
+            print(f"    Progress: {i}/{num_trials}", flush=True)
+
         # Time forward
         dist.barrier()
         torch.cuda.synchronize()
@@ -78,10 +83,13 @@ def benchmark_forward(run_fn, num_trials=100, num_warmup=10):
         # Clean up
         del output
 
+    if rank == 0:
+        print(f"    Progress: {num_trials}/{num_trials} ✓", flush=True)
+
     return times
 
 
-def benchmark_backward(run_fn, grad_output, num_trials=100, num_warmup=10):
+def benchmark_backward(run_fn, grad_output, num_trials=100, num_warmup=10, rank=0):
     """Benchmark forward + backward pass."""
     forward_times = []
     backward_times = []
@@ -90,24 +98,29 @@ def benchmark_backward(run_fn, grad_output, num_trials=100, num_warmup=10):
     # Clear cache once before warmup
     clear_cache()
     dist.barrier()
-    
+
     # Warmup
-    for _ in range(num_warmup):
+    for i in range(num_warmup):
+        if rank == 0 and i == 0:
+            print(f"    Warmup...", flush=True)
         output = run_fn()
         output.backward(grad_output, retain_graph=False)
-    
+
     torch.cuda.synchronize()
     dist.barrier()
-    
+
     # Clear cache once before benchmarking
     clear_cache()
     dist.barrier()
 
     # Benchmark - time each iteration individually for better statistics
-    for _ in range(num_trials):
+    for i in range(num_trials):
+        if rank == 0 and i % 20 == 0:
+            print(f"    Progress: {i}/{num_trials}", flush=True)
+
         # Clear gradients before timing (outside timed region)
         # This is done inside run_fn, but we'll still time it accurately
-        
+
         # Time forward
         dist.barrier()
         torch.cuda.synchronize()
@@ -132,6 +145,9 @@ def benchmark_backward(run_fn, grad_output, num_trials=100, num_warmup=10):
 
         # Clean up
         del output
+
+    if rank == 0:
+        print(f"    Progress: {num_trials}/{num_trials} ✓", flush=True)
 
     return forward_times, backward_times, total_times
 
@@ -180,6 +196,15 @@ def benchmark_all_methods(
 
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
+
+    # Set GPU state for consistent benchmarking
+    torch.backends.cudnn.benchmark = False  # Disable autotuner for consistent timing
+    torch.backends.cudnn.deterministic = True  # Use deterministic algorithms
+    torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 for performance
+
+    # Set manual seed for reproducibility
+    torch.manual_seed(42 + rank)
+    torch.cuda.manual_seed(42 + rank)
 
     sp_size = world_size // dp_size
     initialize_lasp(dp_size, sp_size)
@@ -332,10 +357,10 @@ def benchmark_all_methods(
         # Benchmark forward-only
         if rank == 0:
             print(f"  Running forward-only benchmark: {num_trials} trials with {num_warmup} warmup iterations...")
-        
-        forward_only_times = benchmark_forward(run_forward, num_trials, num_warmup)
+
+        forward_only_times = benchmark_forward(run_forward, num_trials, num_warmup, rank)
         forward_only_stats = compute_stats(forward_only_times)
-        
+
         dist.barrier()
         clear_cache()
         dist.barrier()
@@ -345,7 +370,7 @@ def benchmark_all_methods(
             print(f"  Running forward+backward benchmark: {num_trials} trials with {num_warmup} warmup iterations...")
 
         forward_times, backward_times, total_times = benchmark_backward(
-            run_forward, do_grad, num_trials, num_warmup
+            run_forward, do_grad, num_trials, num_warmup, rank
         )
 
         # Compute statistics
