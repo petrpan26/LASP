@@ -223,7 +223,7 @@ class _PipelinedTreeScanner:
                         for (s, w) in zip(starts, sizes)
                     ]
                     ops = [
-                        dist.P2POp(dist.irecv, recv_bufs[i], src=partner_global, group=self.group)
+                        dist.P2POp(dist.irecv, recv_bufs[i], partner_global, group=self.group)
                         for i in range(len(recv_bufs))
                     ]
                     reqs = dist.batch_isend_irecv(ops)
@@ -260,7 +260,7 @@ class _PipelinedTreeScanner:
                         for (s, w) in zip(starts, sizes)
                     ]
                     ops = [
-                        dist.P2POp(dist.irecv, left_slices[i], src=partner_global, group=self.group)
+                        dist.P2POp(dist.irecv, left_slices[i], partner_global, group=self.group)
                         for i in range(len(left_slices))
                     ]
                     reqs = dist.batch_isend_irecv(ops)
@@ -306,7 +306,7 @@ class _PipelinedTreeScanner:
                     # Receive all d-slices as a batch
                     recv_bufs = [exclusive[:, :, s:s + w, :] for (s, w) in zip(starts, sizes)]
                     ops = [
-                        dist.P2POp(dist.irecv, recv_bufs[i], src=left_global, group=self.group)
+                        dist.P2POp(dist.irecv, recv_bufs[i], left_global, group=self.group)
                         for i in range(len(recv_bufs))
                     ]
                     reqs = dist.batch_isend_irecv(ops)
@@ -330,7 +330,7 @@ class _PipelinedTreeScanner:
                     right_global = dist.get_global_rank(self.group, self.local_rank + 1)
                     recv_bufs = [exclusive[:, :, s:s + w, :] for (s, w) in zip(starts, sizes)]
                     ops = [
-                        dist.P2POp(dist.irecv, recv_bufs[i], src=right_global, group=self.group)
+                        dist.P2POp(dist.irecv, recv_bufs[i], right_global, group=self.group)
                         for i in range(len(recv_bufs))
                     ]
                     reqs = dist.batch_isend_irecv(ops)
