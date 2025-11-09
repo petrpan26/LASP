@@ -1,32 +1,27 @@
 """
-LASP Blelloch V2: Optimized with Inter-Level Pipelining + NCCL Batching
+LASP Blelloch V2: Optimized with Stream Overlap
 
-This version implements state-of-the-art optimizations: inter-level pipelining with
-double buffering and NCCL group batching for minimal overhead.
+Simple, proven optimizations for better latency.
 
 Key Optimizations:
-- Inter-level pipelining: Blocks flow through tree as wavefront across levels
-- Double buffering: Separate buffers per level enable overlapping
-- Block-sliced pipelining: Hide network latency with continuous GPU work
-- NCCL batching: Reduce overhead from 64 calls to ~8 batched calls
-- Stream overlap: Computation and communication in parallel
+- Stream overlap: Run Blelloch scan in separate CUDA stream
+- Async communication: Non-blocking isend/irecv
+- Memory efficient: Reuses buffers throughout tree traversal
 
 Expected Performance:
-- W=16: ~60ms (vs 150ms baseline, 63ms ZeCO)
-- 60% faster than baseline Blelloch
-- MATCHES/BEATS ZeCO at all scales (60ms vs 63ms @ W=16)
-- DOMINATES at W≥32 due to better O(log W) scaling
+- W=16: ~140-150ms (similar to baseline due to fundamental tree overhead)
+- O(log W) scaling: Better than ZeCO at very large W (W≥64)
+- Simpler code: No complex pipelining overhead
 
-Optimizations Applied:
-- Stream overlap + async comm: -45ms
-- Block pipelining: -20ms
-- Inter-level pipelining: -18ms
-- NCCL group batching: -7ms
-- Total improvement: -90ms (60% faster)
+Why Simple is Better:
+- Block pipelining: Adds overhead (8× kernel launches, poor cache locality)
+- NCCL batching: Doesn't help for large messages (NCCL already optimized)
+- Inter-level pipelining: Complex synchronization overhead
+- Stream overlap: Actually helps by running comm + compute in parallel
 
 Trade-off:
-- Memory: +18MB for double buffering (4 levels × 8 blocks)
-- Speed: 2.5× faster than baseline
+- Speed: Modest improvement over baseline (~10-15%)
+- Code: Much simpler and maintainable
 """
 
 import torch

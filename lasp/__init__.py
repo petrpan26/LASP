@@ -5,5 +5,6 @@ from .lasp_zeco import *
 from .lasp_naive import *
 from .lasp_blelloch import *
 from .lasp_blelloch_v2 import *
+from .lasp_blelloch_v3 import *
 from .lightning_attention import *
 from .utils import *
