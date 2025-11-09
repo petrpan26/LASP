@@ -20,10 +20,13 @@ Recent fixes:
    - Fixes the double backward bug that caused large dk/dv errors
 
 The LASP-2 backward implementation now correctly follows the algorithm from the paper:
-1. Local dM computation: dM_r = Q_r^T @ do_r
+1. Local dM computation: Each rank computes dM_r from its local do
 2. AllGather: every rank gets [dM_0, ..., dM_{W-1}]
-3. Weighted suffix: total_dM_r = dM_r + sum_{j>r} weight(r,j) * dM_j
-4. Final gradients: dQ, dK, dV from single backward pass with total_dM
+3. Incoming gradient: incoming_dM_r = sum_{j>r} weight(r,j) * dM_j (successors only)
+4. Final gradients: dQ, dK, dV from single backward (kernel adds local dM to incoming_dM)
+
+Critical fix: incoming_dM contains ONLY successor contributions, not local.
+The backward kernel adds the local contribution automatically, just like in LASP-1.
 """
 
 import torch
@@ -808,12 +811,16 @@ class LaspFuseV2(torch.autograd.Function):
         """
         LASP-2 backward implementation following the algorithm from the paper.
 
-        Algorithm:
-        1. Compute local dM (dKV) from each rank's do
-        2. AllGather all local dM values
-        3. Compute weighted suffix sum of dM (gradients from successors)
-        4. Use total dM to compute dK, dV
-        5. Compute dQ from do and KV states
+        Algorithm (mirrors LASP-1 but with AllGather instead of ring):
+        1. Compute local dM contribution from each rank's do
+        2. AllGather all local dM values across ranks
+        3. Compute incoming dM = weighted sum of SUCCESSOR dM contributions
+        4. Run backward with incoming dM (kernel adds local contribution)
+        5. Return dQ, dK, dV gradients
+
+        Key insight: Just like LASP-1 receives DKV from successor rank and
+        the kernel adds local contribution, LASP-2 computes incoming DKV
+        as weighted sum of successors, then kernel adds local contribution.
         """
         q, k, v, s, local_KV = ctx.saved_tensors
         gamma_list = ctx.gamma_list
@@ -858,18 +865,23 @@ class LaspFuseV2(torch.autograd.Function):
 
         torch.cuda.current_stream().wait_event(comm_done)
 
-        # ============ STEP 3: Compute weighted suffix sum of dM ============
+        # ============ STEP 3: Compute incoming dM from successors ============
         # Gradients flow from later chunks (successors) to earlier chunks
-        # For rank r: total_dM_r = local_dM_r + sum_{j>r} weight(r,j) * local_dM_j
+        # For rank r: incoming_dM = sum_{j>r} weight(r,j) * local_dM_j
         # where weight(r,j) = G[j+1] / G[r+1] (decay from rank j back to rank r)
+        #
+        # CRITICAL: We compute ONLY the incoming gradient from successors.
+        # The lasp_backward kernel will ADD the local contribution itself.
+        # This is exactly how LASP-1 works: receive DKV from successor, then
+        # the kernel adds local contribution and passes to predecessor.
 
-        total_dM = local_dM.clone()  # Start with local contribution
+        incoming_dM = torch.zeros_like(local_dM)
 
         if current_idx < world_size - 1:
             for j in range(current_idx + 1, world_size):
                 # Weight for gradient from rank j flowing back to current rank
                 weight = G[j + 1] / (G[current_idx + 1] + 1e-10)
-                total_dM = total_dM + weight * dM_list[j]
+                incoming_dM = incoming_dM + weight * dM_list[j]
 
         # ============ STEP 4: Reconstruct KV_prefix for computing dQ ============
         KV_list = [torch.empty_like(local_KV) for _ in range(world_size)]
@@ -893,10 +905,12 @@ class LaspFuseV2(torch.autograd.Function):
         # Now we compute dQ, dK, dV using:
         # - do: upstream gradient
         # - KV_prefix: state from predecessors
-        # - total_dM: accumulated gradient state (local + weighted successors)
+        # - incoming_dM: gradient from successors (kernel will add local contribution)
+        #
+        # This mirrors LASP-1: backward receives DKV from successor, computes gradients,
+        # and updates DKV with local contribution to send to predecessor.
 
-        # Run backward with the complete accumulated dM
-        dq, dk, dv = lasp_backward(q, k, v, s, do, KV_prefix, total_dM)
+        dq, dk, dv = lasp_backward(q, k, v, s, do, KV_prefix, incoming_dM)
 
         return dq, dk, dv, None, None, None
 
