@@ -14,6 +14,7 @@ Key ideas:
 """
 
 import math
+import os
 import torch
 import torch.distributed as dist
 import triton
@@ -34,6 +35,21 @@ from .utils import (
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
 )
+
+
+def _debug_enabled():
+    v = os.environ.get("LASP_V3_DEBUG", "0")
+    return not (v in ("0", "", "false", "False"))
+
+
+def _dprint(*args):
+    if _debug_enabled():
+        try:
+            gr = dist.get_rank()
+        except Exception:
+            gr = "?"
+        msg = " ".join(str(a) for a in args)
+        print(f"[v3][rank{gr}] {msg}", flush=True)
 
 
 def _compute_d_slices(d: int, num_blocks: int):
@@ -181,6 +197,9 @@ class _PipelinedTreeScanner:
 
         b, h, d, e = local_value.shape
         starts, sizes = _compute_d_slices(d, self.num_slices)
+        _dprint(f"scan begin reverse={self.reverse} num_levels={self.num_levels} "
+                f"local_rank={self.local_rank} scan_rank={self.scan_rank} "
+                f"slices={len(starts)} d={d}")
         # Working buffer (inclusive rolling aggregate during up-sweep)
         working = local_value.clone()
 
@@ -190,17 +209,21 @@ class _PipelinedTreeScanner:
         # ========== Up-sweep (bottom-up) ==========
         for level in range(self.num_levels):
             partner_scan = self._partner_up(level)
+            _dprint(f"up level={level} partner_scan={partner_scan}")
             if partner_scan == -1:
                 tree_values.append(None)
                 continue
 
             actual_partner = self._scan_to_actual(partner_scan)
             partner_global = dist.get_global_rank(self.group, actual_partner) if actual_partner >= 0 else -1
+            _dprint(f"up level={level} is_sender={self._is_sender_up(level)} "
+                    f"is_receiver={self._is_receiver_up(level)} partner_global={partner_global}")
 
             # Use comm stream for P2P ops
             with torch.cuda.stream(self.cs):
                 if self._is_sender_up(level) and partner_scan < self.world_size:
                     # Send our current aggregate in d-slices
+                    _dprint(f"up level={level} sending {len(starts)} slices to {partner_global}")
                     send_reqs = []
                     for i, (s, w) in enumerate(zip(starts, sizes)):
                         slice_to_send = working[:, :, s:s + w, :].contiguous()
@@ -210,6 +233,7 @@ class _PipelinedTreeScanner:
                         )
                     for req in send_reqs:
                         req.wait()
+                    _dprint(f"up level={level} send complete")
                     # Decide whether to store current value for down-sweep
                     if self._is_sender_down(level):
                         tree_values.append(working.clone())
@@ -218,6 +242,7 @@ class _PipelinedTreeScanner:
 
                 elif self._is_receiver_up(level):
                     # Receive partner slices and combine (batch non-blocking)
+                    _dprint(f"up level={level} receiving {len(starts)} slices from {partner_global}")
                     recv_bufs = [
                         torch.empty((b, h, w, e), dtype=working.dtype, device=working.device)
                         for (s, w) in zip(starts, sizes)
@@ -229,6 +254,7 @@ class _PipelinedTreeScanner:
                     reqs = dist.batch_isend_irecv(ops)
                     for r in reqs:
                         r.wait()
+                    _dprint(f"up level={level} recv complete, combining")
                     for (i, (s, w)) in enumerate(zip(starts, sizes)):
                         recv_bufs[i].record_stream(self.cs)
                         combined = self._combine(recv_bufs[i], working[:, :, s:s + w, :], level)
@@ -240,15 +266,19 @@ class _PipelinedTreeScanner:
         inclusive_ready = False
         for level in range(self.num_levels - 1, -1, -1):
             partner_scan = self._partner_down(level)
+            _dprint(f"down level={level} partner_scan={partner_scan}")
             if partner_scan == -1:
                 continue
             actual_partner = self._scan_to_actual(partner_scan)
             partner_global = dist.get_global_rank(self.group, actual_partner) if actual_partner >= 0 else -1
+            _dprint(f"down level={level} is_sender={self._is_sender_down(level)} "
+                    f"is_receiver={self._is_receiver_down(level)} partner_global={partner_global}")
 
             with torch.cuda.stream(self.cs):
                 if self._is_receiver_down(level) and partner_scan >= 0:
                     # Receive left prefix in d-slices and combine with stored tree value
                     # Use the most recent non-None tree value up to this level
+                    _dprint(f"down level={level} receiving {len(starts)} slices from {partner_global}")
                     tree_idx = min(level, len(tree_values) - 1)
                     tree_val = tree_values[tree_idx]
                     while tree_val is None and tree_idx > 0:
@@ -266,6 +296,7 @@ class _PipelinedTreeScanner:
                     reqs = dist.batch_isend_irecv(ops)
                     for r in reqs:
                         r.wait()
+                    _dprint(f"down level={level} recv complete, combining")
                     for (i, (s, w)) in enumerate(zip(starts, sizes)):
                         left_slices[i].record_stream(self.cs)
                         base_slice = tree_val[:, :, s:s + w, :] if tree_val is not None else working[:, :, s:s + w, :]
@@ -275,6 +306,7 @@ class _PipelinedTreeScanner:
 
                 elif self._is_sender_down(level) and partner_scan < self.world_size:
                     # Send either current inclusive (if ready) or stored tree value slice-by-slice
+                     _dprint(f"down level={level} sending {len(starts)} slices to {partner_global}")
                     if inclusive_ready:
                         send_source = working
                     else:
@@ -294,9 +326,11 @@ class _PipelinedTreeScanner:
                         )
                     for req in send_reqs:
                         req.wait()
+                    _dprint(f"down level={level} send complete")
 
         # If inclusive not set during down-sweep, keep working as-is
         # ========== Convert inclusive → exclusive via neighbor exchange ==========
+        _dprint("exclusive conversion begin")
         exclusive = torch.zeros_like(working)
         with torch.cuda.stream(self.cs):
             if not self.reverse:
@@ -304,6 +338,7 @@ class _PipelinedTreeScanner:
                 if self.local_rank > 0:
                     left_global = dist.get_global_rank(self.group, self.local_rank - 1)
                     # Receive all d-slices as a batch
+                    _dprint(f"exclusive prefix recv from left_global={left_global}")
                     recv_bufs = [exclusive[:, :, s:s + w, :] for (s, w) in zip(starts, sizes)]
                     ops = [
                         dist.P2POp(dist.irecv, recv_bufs[i], left_global, group=self.group)
@@ -315,6 +350,7 @@ class _PipelinedTreeScanner:
                 if self.local_rank < self.world_size - 1:
                     right_global = dist.get_global_rank(self.group, self.local_rank + 1)
                     # Send our inclusive in d-slices
+                    _dprint(f"exclusive prefix send to right_global={right_global}")
                     send_reqs = []
                     for s, w in zip(starts, sizes):
                         src_slice = working[:, :, s:s + w, :].contiguous()
@@ -328,6 +364,7 @@ class _PipelinedTreeScanner:
                 # Suffix: recv from right neighbor (rank+1), send to left neighbor (rank-1)
                 if self.local_rank < self.world_size - 1:
                     right_global = dist.get_global_rank(self.group, self.local_rank + 1)
+                    _dprint(f"exclusive suffix recv from right_global={right_global}")
                     recv_bufs = [exclusive[:, :, s:s + w, :] for (s, w) in zip(starts, sizes)]
                     ops = [
                         dist.P2POp(dist.irecv, recv_bufs[i], right_global, group=self.group)
@@ -338,6 +375,7 @@ class _PipelinedTreeScanner:
                         r.wait()
                 if self.local_rank > 0:
                     left_global = dist.get_global_rank(self.group, self.local_rank - 1)
+                    _dprint(f"exclusive suffix send to left_global={left_global}")
                     send_reqs = []
                     for s, w in zip(starts, sizes):
                         src_slice = working[:, :, s:s + w, :].contiguous()
@@ -348,6 +386,7 @@ class _PipelinedTreeScanner:
                     for req in send_reqs:
                         req.wait()
 
+        _dprint("scan end")
         return exclusive
 
 
@@ -392,12 +431,14 @@ class LaspBlellochV3(torch.autograd.Function):
         o = torch.empty((b, h, n, e), dtype=q.dtype, device=q.device)
 
         # Streams and events
-        comm_stream = torch.cuda.Stream()
+        with torch.cuda.device(q.device.index):
+            comm_stream = torch.cuda.Stream(priority=-1)
         diag_done = torch.cuda.Event()
         local_kv_done = torch.cuda.Event()
         scan_done = torch.cuda.Event()
 
         # Step 1: Diagonal kernel (intra-chunk attention)
+        _dprint("forward: launch diag")
         grid = (b * h * NUM_BLOCK, NUM_CBLOCK)
         with torch.cuda.device(q.device.index):
             _fwd_diag_kernel[grid](
@@ -411,6 +452,7 @@ class LaspBlellochV3(torch.autograd.Function):
         diag_done.record()
 
         # Step 2: Local KV contribution
+        _dprint("forward: compute local KV")
         kv = torch.empty((b, h, NUM_BLOCK + 1, d, e), dtype=torch.float32, device=q.device)
         with torch.cuda.device(q.device.index):
             grid = (b * h, NUM_BLOCK, NUM_FBLOCK * NUM_FBLOCK)
@@ -444,6 +486,7 @@ class LaspBlellochV3(torch.autograd.Function):
         if world_size == 1:
             KV_prefix = KV
         else:
+            _dprint("forward: start scan")
             with torch.cuda.stream(comm_stream):
                 comm_stream.wait_event(local_kv_done)
                 lambda_decay = torch.exp(-s.to(torch.float32))
@@ -460,8 +503,10 @@ class LaspBlellochV3(torch.autograd.Function):
                 )
                 KV_prefix = scanner.scan(local_kv)
                 scan_done.record()
+            _dprint("forward: scan done")
 
         # Step 4: Inter-chunk kernel using KV_prefix
+        _dprint("forward: launch none-diag")
         torch.cuda.current_stream().wait_event(diag_done)
         if world_size > 1:
             torch.cuda.current_stream().wait_event(scan_done)
@@ -500,6 +545,7 @@ class LaspBlellochV3(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do):
+        _dprint("backward: begin")
         q, k, v, s, kv, KV_prefix, DKV = ctx.saved_tensors
         group = ctx.group
         rank = ctx.rank
@@ -524,12 +570,14 @@ class LaspBlellochV3(torch.autograd.Function):
         dv = torch.empty_like(v)
 
         # Streams and events
-        comm_stream = torch.cuda.Stream()
+        with torch.cuda.device(q.device.index):
+            comm_stream = torch.cuda.Stream(priority=-1)
         diag_done = torch.cuda.Event()
         local_dkv_done = torch.cuda.Event()
         scan_done = torch.cuda.Event()
 
         # Step 1: Backward diagonal (intra-chunk)
+        _dprint("backward: launch diag")
         with torch.cuda.device(q.device.index):
             grid = (b * h * NUM_BLOCK, NUM_CBLOCK)
             _bwd_diag_kernel[grid](
@@ -543,6 +591,7 @@ class LaspBlellochV3(torch.autograd.Function):
         diag_done.record()
 
         # Step 2: Local dKV
+        _dprint("backward: compute local dKV")
         dkv = torch.empty((b, h, NUM_BLOCK + 1, d, e), dtype=torch.float32, device=q.device)
         with torch.cuda.device(q.device.index):
             grid = (b * h, NUM_BLOCK, NUM_FBLOCK * NUM_FBLOCK)
@@ -576,6 +625,7 @@ class LaspBlellochV3(torch.autograd.Function):
         if world_size == 1:
             DKV_suffix = DKV
         else:
+            _dprint("backward: start scan")
             with torch.cuda.stream(comm_stream):
                 comm_stream.wait_event(local_dkv_done)
                 lambda_decay = torch.exp(-s.to(torch.float32))
@@ -592,8 +642,10 @@ class LaspBlellochV3(torch.autograd.Function):
                 )
                 DKV_suffix = scanner.scan(local_dkv)
                 scan_done.record()
+            _dprint("backward: scan done")
 
         # Step 4: Inter-chunk gradient kernel
+        _dprint("backward: launch none-diag")
         torch.cuda.current_stream().wait_event(diag_done)
         if world_size > 1:
             torch.cuda.current_stream().wait_event(scan_done)
