@@ -306,7 +306,7 @@ class _PipelinedTreeScanner:
 
                 elif self._is_sender_down(level) and partner_scan < self.world_size:
                     # Send either current inclusive (if ready) or stored tree value slice-by-slice
-                     _dprint(f"down level={level} sending {len(starts)} slices to {partner_global}")
+                    _dprint(f"down level={level} sending {len(starts)} slices to {partner_global}")
                     if inclusive_ready:
                         send_source = working
                     else:
