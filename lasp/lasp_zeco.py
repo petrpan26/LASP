@@ -217,6 +217,13 @@ def all_scan_p2p(
     world_size = dist.get_world_size(group)
     recv_from, send_to = linear_chain_neighbors(rank, world_size, direction)
 
+    # Convert local (group) ranks to global ranks for P2P ops.
+    # PyTorch P2P with `group` expects global ranks.
+    global_rank = dist.get_rank()
+    rank_offset = global_rank - rank  # start of this SP group in global rank space
+    recv_from_global = None if recv_from is None else recv_from + rank_offset
+    send_to_global = None if send_to is None else send_to + rank_offset
+
     b, h, d, e = S_local.shape
     device = S_local.device
     dtype = S_local.dtype
@@ -265,10 +272,12 @@ def all_scan_p2p(
     with torch.cuda.stream(cs):
         work_recv = [None] * true_blocks
         work_send = [None] * true_blocks
+        # Keep references to send buffers alive until their corresponding send completes
+        send_bufs = [None] * true_blocks
 
         # Pre-post first receive to overlap with first block computation
         if recv_from is not None and true_blocks > 0:
-            work_recv[0] = dist.irecv(tensor=recv_bufs[0], src=recv_from, group=group)
+            work_recv[0] = dist.irecv(tensor=recv_bufs[0], src=recv_from_global, group=group)
 
         for i in range(true_blocks):
             s = starts[i]
@@ -296,20 +305,21 @@ def all_scan_p2p(
 
             # Post send of this block immediately (pipelining)
             if send_to is not None:
-                upd_contig = upd.contiguous()
+                # Ensure dtype matches receiver buffer dtype (S_local.dtype)
+                upd_send = upd.to(dtype)
+                upd_contig = upd_send.contiguous()
                 # Record stream to ensure producer ops complete before send
                 upd_contig.record_stream(cs)
-                work_send[i] = dist.isend(tensor=upd_contig, dst=send_to, group=group)
+                work_send[i] = dist.isend(tensor=upd_contig, dst=send_to_global, group=group)
+                send_bufs[i] = upd_contig  # hold reference until send completes
 
             # Pre-post next receive as soon as possible to overlap
             nxt = i + 1
             if recv_from is not None and nxt < true_blocks:
-                work_recv[nxt] = dist.irecv(tensor=recv_bufs[nxt], src=recv_from, group=group)
+                work_recv[nxt] = dist.irecv(tensor=recv_bufs[nxt], src=recv_from_global, group=group)
 
         # Wait for all sends to complete before buffers go out of scope
-        # Note: record_stream() calls ensure CUDA ops complete before sends finish
-        # DO NOT add cs.synchronize() here - it causes deadlock in chain topology!
-        for w in work_send:
+        for j, w in enumerate(work_send):
             if w is not None:
                 w.wait()
 
@@ -369,18 +379,16 @@ class LaspZeCo(torch.autograd.Function):
 
         # Step 3: Launch All-Scan on comm stream (forward direction)
         # This runs asynchronously while we could do local intra-chunk work
-        # NOTE: all_scan_p2p manages its own stream context internally
-        S_pred, S_out = all_scan_p2p(
-            S_local=local_KV,
-            gamma_tilde=gamma_tilde_expanded,
-            group=group,
-            direction="fwd",
-            num_blocks=num_blocks,
-            comm_stream=comm_stream,
-        )
-        # Record completion event in the comm stream
         with torch.cuda.stream(comm_stream):
-            comm_done.record()
+            S_pred, S_out = all_scan_p2p(
+                S_local=local_KV,
+                gamma_tilde=gamma_tilde_expanded,
+                group=group,
+                direction="fwd",
+                num_blocks=num_blocks,
+                comm_stream=comm_stream,
+            )
+            comm_done.record(comm_stream)
 
         # Step 4: Wait for All-Scan to complete before computing local attention
         # NOTE: Future optimization could overlap local computation with All-Scan
@@ -447,18 +455,16 @@ class LaspZeCo(torch.autograd.Function):
         # Fix: Pass the actual computed dKV_local, not zeros!
         gamma_tilde_expanded = gamma_tilde.unsqueeze(-1)
 
-        # NOTE: all_scan_p2p manages its own stream context internally
-        dKV_pred, dKV_out = all_scan_p2p(
-            S_local=dKV_local,
-            gamma_tilde=gamma_tilde_expanded,
-            group=group,
-            direction="bwd",  # Reverse direction for backward pass
-            num_blocks=num_blocks,
-            comm_stream=comm_stream,
-        )
-        # Record completion event in the comm stream
         with torch.cuda.stream(comm_stream):
-            comm_done.record()
+            dKV_pred, dKV_out = all_scan_p2p(
+                S_local=dKV_local,
+                gamma_tilde=gamma_tilde_expanded,
+                group=group,
+                direction="bwd",  # Reverse direction for backward pass
+                num_blocks=num_blocks,
+                comm_stream=comm_stream,
+            )
+            comm_done.record(comm_stream)
 
         # Wait for backward All-Scan
         torch.cuda.current_stream().wait_event(comm_done)

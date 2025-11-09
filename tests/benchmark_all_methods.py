@@ -14,6 +14,7 @@ import gc
 import json
 import time
 from collections import defaultdict
+import os
 
 import torch
 import torch.distributed as dist
@@ -43,32 +44,27 @@ def clear_cache():
     torch.cuda.synchronize()
 
 
-def benchmark_forward(run_fn, num_trials=100, num_warmup=10, rank=0):
+def benchmark_forward(run_fn, num_trials=100, num_warmup=10):
     """Benchmark forward pass only."""
     times = []
 
     # Clear cache once before warmup
     clear_cache()
     dist.barrier()
-
+    
     # Warmup
-    for i in range(num_warmup):
-        if rank == 0 and i == 0:
-            print(f"    Warmup...", flush=True)
+    for _ in range(num_warmup):
         _ = run_fn()
-
+    
     torch.cuda.synchronize()
     dist.barrier()
-
+    
     # Clear cache once before benchmarking
     clear_cache()
     dist.barrier()
 
     # Benchmark
-    for i in range(num_trials):
-        if rank == 0 and i % 20 == 0:
-            print(f"    Progress: {i}/{num_trials}", flush=True)
-
+    for _ in range(num_trials):
         # Time forward
         dist.barrier()
         torch.cuda.synchronize()
@@ -83,13 +79,10 @@ def benchmark_forward(run_fn, num_trials=100, num_warmup=10, rank=0):
         # Clean up
         del output
 
-    if rank == 0:
-        print(f"    Progress: {num_trials}/{num_trials} ✓", flush=True)
-
     return times
 
 
-def benchmark_backward(run_fn, grad_output, num_trials=100, num_warmup=10, rank=0):
+def benchmark_backward(run_fn, grad_output, num_trials=100, num_warmup=10):
     """Benchmark forward + backward pass."""
     forward_times = []
     backward_times = []
@@ -98,29 +91,24 @@ def benchmark_backward(run_fn, grad_output, num_trials=100, num_warmup=10, rank=
     # Clear cache once before warmup
     clear_cache()
     dist.barrier()
-
+    
     # Warmup
-    for i in range(num_warmup):
-        if rank == 0 and i == 0:
-            print(f"    Warmup...", flush=True)
+    for _ in range(num_warmup):
         output = run_fn()
         output.backward(grad_output, retain_graph=False)
-
+    
     torch.cuda.synchronize()
     dist.barrier()
-
+    
     # Clear cache once before benchmarking
     clear_cache()
     dist.barrier()
 
     # Benchmark - time each iteration individually for better statistics
-    for i in range(num_trials):
-        if rank == 0 and i % 20 == 0:
-            print(f"    Progress: {i}/{num_trials}", flush=True)
-
+    for _ in range(num_trials):
         # Clear gradients before timing (outside timed region)
         # This is done inside run_fn, but we'll still time it accurately
-
+        
         # Time forward
         dist.barrier()
         torch.cuda.synchronize()
@@ -145,9 +133,6 @@ def benchmark_backward(run_fn, grad_output, num_trials=100, num_warmup=10, rank=
 
         # Clean up
         del output
-
-    if rank == 0:
-        print(f"    Progress: {num_trials}/{num_trials} ✓", flush=True)
 
     return forward_times, backward_times, total_times
 
@@ -196,15 +181,6 @@ def benchmark_all_methods(
 
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
-
-    # Set GPU state for consistent benchmarking
-    torch.backends.cudnn.benchmark = False  # Disable autotuner for consistent timing
-    torch.backends.cudnn.deterministic = True  # Use deterministic algorithms
-    torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 for performance
-
-    # Set manual seed for reproducibility
-    torch.manual_seed(42 + rank)
-    torch.cuda.manual_seed(42 + rank)
 
     sp_size = world_size // dp_size
     initialize_lasp(dp_size, sp_size)
@@ -329,6 +305,9 @@ def benchmark_all_methods(
 
         elif method_info["needs_buffers"] == "zeco":
             # ZeCO interface - no KV/DKV buffers needed
+            # ZeCO uses async P2P communication in CUDA streams
+            # CRITICAL: zeco uses async NCCL operations that must complete before barriers
+            # We need to ensure all CUDA streams AND NCCL operations complete
             def run_forward():
                 # Clear gradients outside timed region for fairness
                 if q.grad is not None:
@@ -337,7 +316,13 @@ def benchmark_all_methods(
                     k.grad.zero_()
                 if v.grad is not None:
                     v.grad.zero_()
-                return method_info["fn"](q, k, v, s)
+                output = method_info["fn"](q, k, v, s)
+                # CRITICAL: Synchronize all CUDA streams to ensure async operations complete
+                # This includes the comm_stream used by zeco's all_scan_p2p
+                torch.cuda.synchronize(device)
+                # Additional sync to ensure NCCL operations are flushed
+                # Note: dist.barrier() will be called after this function returns
+                return output
 
         else:
             # Fuse interface: fuse, fuse_v2, fuse_parallel
@@ -357,10 +342,40 @@ def benchmark_all_methods(
         # Benchmark forward-only
         if rank == 0:
             print(f"  Running forward-only benchmark: {num_trials} trials with {num_warmup} warmup iterations...")
-
-        forward_only_times = benchmark_forward(run_forward, num_trials, num_warmup, rank)
-        forward_only_stats = compute_stats(forward_only_times)
-
+        
+        # Special handling for zeco: ensure all async operations complete
+        if method_name == "zeco":
+            # For zeco, we need to ensure NCCL operations complete before barriers
+            # Add an extra barrier after warmup and before benchmarking
+            forward_only_times = []
+            clear_cache()
+            dist.barrier()
+            
+            # Warmup with explicit sync
+            for _ in range(num_warmup):
+                _ = run_forward()
+                torch.cuda.synchronize()
+                dist.barrier()
+            
+            clear_cache()
+            dist.barrier()
+            
+            # Benchmark with explicit sync
+            for _ in range(num_trials):
+                dist.barrier()
+                torch.cuda.synchronize()
+                start = time.perf_counter()
+                output = run_forward()
+                torch.cuda.synchronize()
+                dist.barrier()  # Ensure all NCCL ops complete
+                elapsed = (time.perf_counter() - start) * 1000
+                forward_only_times.append(elapsed)
+                del output
+            forward_only_stats = compute_stats(forward_only_times)
+        else:
+            forward_only_times = benchmark_forward(run_forward, num_trials, num_warmup)
+            forward_only_stats = compute_stats(forward_only_times)
+        
         dist.barrier()
         clear_cache()
         dist.barrier()
@@ -369,9 +384,53 @@ def benchmark_all_methods(
         if rank == 0:
             print(f"  Running forward+backward benchmark: {num_trials} trials with {num_warmup} warmup iterations...")
 
-        forward_times, backward_times, total_times = benchmark_backward(
-            run_forward, do_grad, num_trials, num_warmup, rank
-        )
+        # Special handling for zeco backward pass
+        if method_name == "zeco":
+            forward_times = []
+            backward_times = []
+            total_times = []
+            
+            clear_cache()
+            dist.barrier()
+            
+            # Warmup with explicit sync
+            for _ in range(num_warmup):
+                output = run_forward()
+                torch.cuda.synchronize()
+                dist.barrier()
+                output.backward(do_grad, retain_graph=False)
+                torch.cuda.synchronize()
+                dist.barrier()
+            
+            clear_cache()
+            dist.barrier()
+            
+            # Benchmark with explicit sync
+            for _ in range(num_trials):
+                dist.barrier()
+                torch.cuda.synchronize()
+                start_fwd = time.perf_counter()
+                output = run_forward()
+                torch.cuda.synchronize()
+                dist.barrier()  # Ensure NCCL ops complete
+                fwd_time = (time.perf_counter() - start_fwd) * 1000
+                
+                dist.barrier()
+                torch.cuda.synchronize()
+                start_bwd = time.perf_counter()
+                output.backward(do_grad, retain_graph=False)
+                torch.cuda.synchronize()
+                dist.barrier()  # Ensure NCCL ops complete
+                bwd_time = (time.perf_counter() - start_bwd) * 1000
+                
+                forward_times.append(fwd_time)
+                backward_times.append(bwd_time)
+                total_times.append(fwd_time + bwd_time)
+                del output
+        else:
+            forward_times, backward_times, total_times = benchmark_backward(
+                run_forward, do_grad, num_trials, num_warmup
+            )
 
         # Compute statistics
         forward_stats = compute_stats(forward_times)
